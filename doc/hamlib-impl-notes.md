@@ -126,8 +126,8 @@ Lifecycle hooks (rig.h:2459–2462):
 
 - `rig_init` → `int (*)(RIG *rig)` → system600: TBD (allocates priv)
 - `rig_cleanup` → `int (*)(RIG *rig)` → system600: TBD (frees priv)
-- `rig_open` → `int (*)(RIG *rig)` → system600: 0/NULL-allowed (frontend returns -RIG_ENIMPL when a hook is NULL, src/rig.c:8239-8241)
-- `rig_close` → `int (*)(RIG *rig)` → system600: 0/NULL-allowed (src/rig.c:8259-8261)
+- `rig_open` → `int (*)(RIG *rig)` → system600: 0/NULL-allowed — NULL hook is silently skipped → RIG_OK (`if (caps->rig_open != NULL)` src/rig.c:1506, call `status = caps->rig_open(rig);` src/rig.c:1536)
+- `rig_close` → `int (*)(RIG *rig)` → system600: 0/NULL-allowed — NULL hook skipped, return code ignored (`if (caps->rig_close)` src/rig.c:1791)
 
 API hooks — 17+ required per Task (rig.h:2469+):
 
@@ -245,20 +245,25 @@ MISMATCH NOTE: `grep "#define RIG_OK\|…"` → no output; codes are members of 
 - Full enum rig.h:205-233 (ECONF=2, ENOMEM=3, EIO=6, EINTERNAL=7, ERJCTED=9, ETRUNC=10, ENTARGET=12, BUSERROR=13, BUSBUSY=14, EARG=15, EVFO=16, EDOM=17, EDEPRECATED=18, ESECURITY=19, EPOWER=20, ELIMIT=21, EACCESS=22, EEND last).
 - Soft errors (no retry/re-init helps): `#define RIG_IS_SOFT_ERRCODE(errcode)` — rig.h:236-240, includes `-RIG_EINVAL || -RIG_ENIMPL || -RIG_ERJCTED || -RIG_ETRUNC || -RIG_ENAVAIL || …`.
 - Wire token: `#define NETRIGCTL_RET "RPRT "` — rig.h:245.
-- ENIMPL attribution: frontend returns `-RIG_ENIMPL` when the caps hook is NULL — src/rig.c:8239-8241 verbatim:
-  ```c
-  if (rig->caps->set_clock == NULL)
-  {
-      return -RIG_ENIMPL;
-  }
-  ```
-  same pattern src/rig.c:8259-8261 (`get_clock`). Other frontend ENIMPL returns: src/rig.c:1041 (doc: "port type communication is not implemented yet"), 2837, 3719, 4359, 5081, 5327, 5481.
-- has_* mask → ENIMPL verbatim line: NOT FOUND — tried `grep -n "ENIMPL" src/rig.c | head -12`; hits are NULL-hook and path returns above, no `has_get_level`-mask check captured in one attempt. Backend rule: a backend that does not implement a NULLed-out hook gets `-RIG_ENIMPL` from the frontend for free; if it registers a hook it must itself `return -RIG_ENIMPL;` for unsupported args (frg9600.c idiom: `return -RIG_EINVAL;` for wrong MODE, rigs/yaesu/frg9600.c:189).
-- (Supplement) Actual frontend ENIMPL mechanism (verified `grep -n -B3 -A6 "RIG_ENIMPL" src/rig.c`) — the frontend returns `-RIG_ENIMPL` WITHOUT calling the backend in three cases:
-  1. caps hook pointer is NULL (ternary guard): `retcode = caps->get_freq ? caps->get_freq(rig, RIG_VFO_CURR, tx_freq) : -RIG_ENIMPL;` — src/rig.c:5080-5081 (split-freq get path); identical guards for `set_mode` src/rig.c:5326-5327 and `get_mode` src/rig.c:5480-5481; `if (rig->caps->set_clock == NULL) { return -RIG_ENIMPL; }` src/rig.c:8239-8241 (rig_set_clock) and get_clock src/rig.c:8259-8261; `if (caps->get_dcd == NULL) { … RETURNFUNC(-RIG_ENIMPL); }` src/rig.c:4356-4359.
-  2. caps `targetable_vfo` bitmask lacks the needed capability: ENIMPL returned in the block whose guard is `if ((caps->targetable_vfo & RIG_TARGETABLE_PTT) || vfo == RIG_VFO_CURR || …)` failing — src/rig.c:3719 with condition at :3722 (same idiom :4074).
-  3. unimplemented port type in `rig_open`: doc `\retval -RIG_ENIMPL   port type communication is not implemented yet.` src/rig.c:1041 (function `rig_open` at :1045).
-  No `has_get_*`/`has_set_*` mask→ENIMPL check was found in src/rig.c in the greps performed; the has_* masks gate which levels/funcs the frontend advertises, while the NULL-hook/targetable_vfo checks above are what produce -RIG_ENIMPL.
+- ENIMPL-vs-ENAVAIL policy (corrected in fix round 1; every line verified). The dominant frontend default for a **NULL caps hook is `-RIG_ENAVAIL`**, not ENIMPL:
+  - `rig_set_freq`: `if (caps->set_freq == NULL) { … RETURNFUNC(-RIG_ENAVAIL); }` — src/rig.c:2271-2275.
+  - `rig_get_freq`: same pattern → `-RIG_ENAVAIL` — src/rig.c:2670-2675.
+  - `rig_set_ts`: `if (caps->set_ts == NULL) { RETURNFUNC(-RIG_ENAVAIL); }` — src/rig.c:6418-6421.
+  - `rig_set_ant`: `if (caps->set_ant == NULL) { RETURNFUNC(-RIG_ENAVAIL); }` — src/rig.c:6572-6575.
+- ENIMPL-on-NULL exists ONLY for these (everything else defaults to ENAVAIL or OK):
+  - `set_ptt`: `if (caps->set_ptt == NULL) { … RETURNFUNC(-RIG_ENIMPL); }` — src/rig.c:3717-3719.
+  - `get_dcd`: `if (caps->get_dcd == NULL) { … RETURNFUNC(-RIG_ENIMPL); }` — src/rig.c:4356-4359.
+  - split-VFO fallbacks (ternary): `retcode = caps->get_freq ? caps->get_freq(rig, RIG_VFO_CURR, tx_freq) : -RIG_ENIMPL;` — src/rig.c:5080-5081; `set_mode` src/rig.c:5326-5327; `get_mode` src/rig.c:5480-5481.
+  - clock: `if (rig->caps->set_clock == NULL) { return -RIG_ENIMPL; }` — src/rig.c:8239-8241; `get_clock` src/rig.c:8259-8261.
+  - unimplemented port type in `rig_open`: doc `\retval -RIG_ENIMPL   port type communication is not implemented yet.` — src/rig.c:1041 (function `rig_open` at :1045).
+- Silent **RIG_OK** (no error) on NULL hook:
+  - `rig_open`: NULL hook skipped — `if (caps->rig_open != NULL)` src/rig.c:1506, call `status = caps->rig_open(rig);` src/rig.c:1536.
+  - `rig_close`: NULL hook skipped, return code ignored — `if (caps->rig_close)` src/rig.c:1791.
+  - `get_ptt`: `if (!caps->get_ptt) { *ptt = rs->transmit ? RIG_PTT_ON : RIG_PTT_OFF; … RETURNFUNC(RIG_OK); }` — src/rig.c:4067-4071.
+- has_* masks DO affect error returns (not just advertising): `rig_set_level`: `if (caps->set_level == NULL || !rig_has_set_level(rig, level)) { return -RIG_ENAVAIL; }` — src/settings.c:90-93; `rig_get_level`: `if (caps->get_level == NULL || !rig_has_get_level(rig, level)) { return -RIG_ENAVAIL; }` — src/settings.c:180-183. Client side too: `if (!rig_has_set_level(rig, level)) … RETURNFUNC2(-RIG_ENAVAIL);` — tests/rigctl_parse.c:3698-3706; `if (!rig_has_get_level(rig, level))` → -RIG_ENAVAIL — tests/rigctl_parse.c:3804. ⇒ A level not listed in `has_get_level`/`has_set_level` yields **RPRT -11 (ENAVAIL)**, never -4.
+- No `has_*` mask→ENIMPL check exists in src/rig.c (kept TRUE); `has_get_level` is only copied and auto-adds STRENGTH when RAWSTR+str_cal present: `rs->has_get_level = caps->has_get_level;` src/rig.c:972; `if ((caps->has_get_level & RIG_LEVEL_STRENGTH) == 0 && (caps->has_get_level & RIG_LEVEL_RAWSTR) == RIG_LEVEL_RAWSTR && caps->str_cal.size) { rs->has_get_level |= RIG_LEVEL_STRENGTH; }` src/rig.c:978-983.
+- Missing `targetable_vfo` bit does NOT yield ENIMPL: when the PTT-targetable condition `if ((caps->targetable_vfo & RIG_TARGETABLE_PTT) || vfo == RIG_VFO_CURR || vfo == rig_get_current_vfo_state(rig))` (src/rig.c:3722) fails, the frontend falls back to VFO-swap; if `caps->set_vfo` is NULL in that path → `-RIG_ENAVAIL` — src/rig.c:3773-3777. (The :3719 ENIMPL is the separate `caps->set_ptt == NULL` guard at :3717-3720, not the targetable check.)
+- Wire rule for system600 downstream assertions: missing/unsupported hook or unadvertised has_* bit → frontend default **-11 (ENAVAIL)**; **-4 (ENIMPL)** only in the enumerated set_ptt/get_dcd/split-fallback/clock/port-type cases; a backend-registered hook must itself `return -RIG_ENIMPL;` for unsupported args (frg9600 idiom: `return -RIG_EINVAL;` for wrong MODE, rigs/yaesu/frg9600.c:189).
 
 ## 5. Registration checklist
 
