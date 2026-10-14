@@ -33,6 +33,9 @@
 
 #include "yaesu.h"
 
+/* Not yet in yaesu.h: declared here per Task 4 registration checklist. */
+extern struct rig_caps system600_caps;
+
 struct yaesu_id
 {
     rig_model_t model;
@@ -125,6 +128,7 @@ DECLARE_INITRIG_BACKEND(yaesu)
     rig_register(&mchfqrp_caps);
     rig_register(&ft650_caps);
     rig_register(&ft710_caps);
+    rig_register(&system600_caps);
 
     return RIG_OK;
 }

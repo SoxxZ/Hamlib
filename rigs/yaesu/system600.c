@@ -1,14 +1,16 @@
 /*
- * system600.c - Yaesu System 600 (FT-600) CAT pure codec.
+ * system600.c - Yaesu System 600 (FT-600) CAT codec + Hamlib backend.
  *
  * Ported strictly from ft600rig/protocol.py (the source of truth for this
  * backend); the protocol.py -> C helper mapping with line numbers is
  * recorded in task-3-report.md.  Agent-reference section numbers in
  * comments refer to YAESU_SYSTEM600_CAT_PROTOCOL_AGENT_REFERENCE.txt.
  *
- * Pure functions only: no serial I/O, no Hamlib callbacks, no registration,
- * no Hamlib headers (<stdint.h>/<string.h> only).  Task 3 of the system600
- * backend plan; Tasks 4+ add the Hamlib glue on top of these statics.
+ * Two sections: (1) the pure codec - no serial I/O, no Hamlib callbacks,
+ * no registration, <stdint.h>/<string.h> only - and (2) below the codec,
+ * the Hamlib glue (open/close/set_freq/get_freq + system600_caps, Task 4).
+ * Pure-codec consumers (sys600_veccheck.c) define SYSTEM600_CODEC_ONLY
+ * before including this file to compile section 1 alone.
  *
  * Return convention: 0 on success, negative on invalid input - mirroring
  * Hamlib's RIG_OK / negative-error convention (doc/hamlib-impl-notes.md
@@ -18,7 +20,25 @@
 #include <stdint.h>
 #include <string.h>
 
+#ifndef SYSTEM600_CODEC_ONLY
+#include "hamlib/rig.h"
+#include "iofunc.h"
+#include "misc.h"
+#endif
+
 #include "system600.h"
+
+/*
+ * Not every codec helper is consumed by the Task 4 glue yet (BCD inverse,
+ * flags/meter decode and the mode translators are wired up by later tasks;
+ * the vector harness exercises them today).  Silence -Wunused-function for
+ * them until then.
+ */
+#if defined(__GNUC__) || defined(__clang__)
+#define SYS600_UNUSED_FN __attribute__((unused))
+#else
+#define SYS600_UNUSED_FN
+#endif
 
 /*
  * Build the 5-byte wire frame [P4][P3][P2][P1][OPCODE]
@@ -71,7 +91,7 @@ static int sys600_freq_to_bcd(uint32_t hz, uint8_t out[4])
  * (protocol.py:175-183 bcd_params_to_freq; used by tests/simulators).
  * Returns 0, or -1 if a nibble is not a decimal digit.
  */
-static int sys600_bcd_to_freq(const uint8_t in[4], uint32_t *hz)
+static SYS600_UNUSED_FN int sys600_bcd_to_freq(const uint8_t in[4], uint32_t *hz)
 {
     uint32_t units = 0;
     int i;
@@ -169,7 +189,7 @@ struct sys600_flags {
  * Returns 0, or -1 if the fixed 06 04 tail does not match (protocol.py
  * only checks the length; the tail check is a deliberate addition).
  */
-static int sys600_decode_flags(const uint8_t reply[SYS600_FLAGS_REPLY_LEN],
+static SYS600_UNUSED_FN int sys600_decode_flags(const uint8_t reply[SYS600_FLAGS_REPLY_LEN],
                                struct sys600_flags *out)
 {
     if (reply[3] != SYS600_FLAGS_REPLY_TAIL0 ||
@@ -200,7 +220,7 @@ static int sys600_decode_flags(const uint8_t reply[SYS600_FLAGS_REPLY_LEN],
  * meter byte M (0..255), or -1 if the fixed F7 tail does not match
  * (protocol.py:315-318 decode_meter; radio.py:139-141; agent ref sec 8.3).
  */
-static int sys600_decode_meter(const uint8_t reply[SYS600_METER_REPLY_LEN])
+static SYS600_UNUSED_FN int sys600_decode_meter(const uint8_t reply[SYS600_METER_REPLY_LEN])
 {
     if (reply[4] != SYS600_METER_REPLY_TAIL) {
         return -1;
@@ -252,7 +272,7 @@ static const uint8_t sys600_mode_status_to_cmd_tbl[6] = {
  * Translate a MODE (0Ch) command code to the status-data mode byte.
  * Returns 0, or -1 for an invalid/reserved command code.
  */
-static int sys600_mode_cmd_to_status(uint8_t cmd, uint8_t *status)
+static SYS600_UNUSED_FN int sys600_mode_cmd_to_status(uint8_t cmd, uint8_t *status)
 {
     if ((unsigned)cmd >= sizeof(sys600_mode_cmd_to_status_tbl) ||
         sys600_mode_cmd_to_status_tbl[cmd] == 0xFF) {
@@ -266,7 +286,7 @@ static int sys600_mode_cmd_to_status(uint8_t cmd, uint8_t *status)
  * Translate a status-data mode byte to a MODE (0Ch) command code.
  * Returns 0, or -1 for an out-of-table status code.
  */
-static int sys600_mode_status_to_cmd(uint8_t status, uint8_t *cmd)
+static SYS600_UNUSED_FN int sys600_mode_status_to_cmd(uint8_t status, uint8_t *cmd)
 {
     if ((unsigned)status >= sizeof(sys600_mode_status_to_cmd_tbl)) {
         return -1;
@@ -274,3 +294,284 @@ static int sys600_mode_status_to_cmd(uint8_t status, uint8_t *cmd)
     *cmd = sys600_mode_status_to_cmd_tbl[status];
     return 0;
 }
+
+
+/*
+ * =====================================================================
+ * Hamlib glue (Task 4): open/close, set/get freq, minimal registration.
+ * Port semantics come from ft600rig/radio.py; call idioms from
+ * doc/hamlib-impl-notes.md sec 1.
+ * =====================================================================
+ */
+
+#ifndef SYSTEM600_CODEC_ONLY
+
+/*
+ * Mode set advertised in the range/tuning-step lists.  CAT has no CWR, so
+ * CW only (wide/narrow are filter variants of the same RIG_MODE_CW).
+ */
+#define SYSTEM600_MODES (RIG_MODE_LSB | RIG_MODE_USB | RIG_MODE_CW | \
+                         RIG_MODE_AM | RIG_MODE_PKTLSB | RIG_MODE_PKTUSB)
+
+static int sys600_read_status(RIG *rig, uint8_t rec[SYS600_REC_LEN]);
+static int system600_open(RIG *rig);
+static int system600_close(RIG *rig);
+static int system600_set_freq(RIG *rig, vfo_t vfo, freq_t freq);
+static int system600_get_freq(RIG *rig, vfo_t vfo, freq_t *freq);
+
+/*
+ * Status Update (10h) with U=2: request, then read exactly the 19-byte
+ * operating record.  Mirrors radio.py:115-132 (_query): flush stale input
+ * first so the reply stays aligned, then write, then read the expected
+ * size.  Never U=0 (1941 bytes).
+ *
+ * Returns RIG_OK, -RIG_ETIMEOUT if the radio did not answer within the
+ * port timeout, -RIG_EPROTO for any short/wrong-length reply, or the
+ * write_block error verbatim.
+ */
+static int sys600_read_status(RIG *rig, uint8_t rec[SYS600_REC_LEN])
+{
+    uint8_t frame[SYS600_FRAME_LEN];
+    uint8_t buf[SYS600_STATUS_SIZE_U2 + 1];
+    int ret;
+
+    /* P1 = U selector, everything else 0 (protocol.py:355-362 status_frame). */
+    sys600_frame(SYS600_OP_STATUS, 2, 0, 0, 0, frame);
+
+    /* Drop stale bytes so we stay aligned (radio.py:117 reset_input_buffer). */
+    rig_flush(RIGPORT(rig));
+
+    ret = write_block(RIGPORT(rig), frame, SYS600_FRAME_LEN);
+    if (ret != RIG_OK)
+    {
+        return ret;
+    }
+
+    /*
+     * No stopset: the status record is binary and every byte value (0x00
+     * padding included) can occur, so termination is by length only.
+     * expected_len=1 is the documented read idiom (notes sec 1, netrigctl
+     * rigs/dummy/netrigctl.c:326): read_string then pulls exactly one
+     * byte per port_read and stops at rxmax-1 = 19 bytes (rxmax carries
+     * the +1 for its end-of-string byte).  An expected_len of 19 would
+     * instead take read_string_generic's adaptive-minlen path, which
+     * decrements its static minlen per read and issues a zero-length
+     * read after the first byte.
+     */
+    ret = read_string(RIGPORT(rig), buf, sizeof(buf), NULL, 0, 0, 1);
+    if (ret < 0)
+    {
+        return ret; /* -RIG_ETIMEOUT (a timeout is a timeout, even partial) */
+    }
+
+    if (ret != SYS600_STATUS_SIZE_U2)
+    {
+        rig_debug(RIG_DEBUG_ERR,
+                  "%s: short status reply: expected %d bytes, got %d\n",
+                  __func__, SYS600_STATUS_SIZE_U2, ret);
+        return -RIG_EPROTO;
+    }
+
+    memcpy(rec, buf, SYS600_REC_LEN);
+    return RIG_OK;
+}
+
+/*
+ * Open: the serial framing (4800 8N2) is applied by the frontend from the
+ * model-default caps fields (notes sec 1: serial_* caps, frg9600.c:55-70),
+ * not here - backends do not poke port params in rig_open.  Sync means:
+ * flush whatever a previous session left behind (radio.py:82
+ * reset_input_buffer) and exchange exactly one U=2 status request/response.
+ */
+static int system600_open(RIG *rig)
+{
+    uint8_t rec[SYS600_REC_LEN];
+    int ret;
+
+    /* radio.py:82 - drop anything left over so reads start aligned. */
+    rig_flush(RIGPORT(rig));
+
+    ret = sys600_read_status(rig, rec);
+    if (ret != RIG_OK)
+    {
+        rig_debug(RIG_DEBUG_ERR, "%s: status sync failed: %d\n", __func__, ret);
+        return ret;
+    }
+
+    return RIG_OK;
+}
+
+/*
+ * Close: best effort - never leave the transmitter keyed on exit
+ * (radio.py:85-93 close always sends PTT-off and swallows errors).
+ * The frontend ignores the rig_close return code (notes sec 4).
+ */
+static int system600_close(RIG *rig)
+{
+    uint8_t frame[SYS600_FRAME_LEN];
+    int ret;
+
+    sys600_frame(SYS600_OP_PTT, 0, 0, 0, 0, frame); /* T=0: transmitter off */
+    ret = write_block(RIGPORT(rig), frame, SYS600_FRAME_LEN);
+    if (ret != RIG_OK)
+    {
+        rig_debug(RIG_DEBUG_ERR, "%s: PTT-off safety frame failed: %d\n",
+                  __func__, ret);
+    }
+
+    return RIG_OK;
+}
+
+/*
+ * Set Rx/operating frequency (0Ah, BCD) with read-back verification
+ * (radio.py:144-155): this radio silently ignores out-of-range commands,
+ * so a set that does not stick is reported as -RIG_EPROTO instead of
+ * failing silently.
+ */
+static int system600_set_freq(RIG *rig, vfo_t vfo, freq_t freq)
+{
+    uint8_t frame[SYS600_FRAME_LEN];
+    uint8_t bcd[4];
+    uint8_t rec[SYS600_REC_LEN];
+    uint8_t mode, mem;
+    uint32_t rx_hz, tx_hz;
+    int ret;
+
+    (void)vfo; /* 0Ah always targets the current operating VFO */
+
+    /* 100 kHz .. 30 MHz (radio.py:146-150, protocol span). */
+    if (!(freq >= (freq_t)SYS600_FREQ_MIN_HZ &&
+            freq <= (freq_t)SYS600_FREQ_MAX_HZ))
+    {
+        return -RIG_EINVAL;
+    }
+
+    if (sys600_freq_to_bcd((uint32_t)freq, bcd) != 0)
+    {
+        return -RIG_EINVAL;
+    }
+
+    /* Wire order F4,F3,F2,F1,opcode (protocol.py:163-166 set_freq_frame). */
+    sys600_frame(SYS600_OP_SET_RX_FREQ, bcd[0], bcd[1], bcd[2], bcd[3], frame);
+    ret = write_block(RIGPORT(rig), frame, SYS600_FRAME_LEN);
+    if (ret != RIG_OK)
+    {
+        return ret;
+    }
+
+    /* Read-back confirm: the Rx sub-record must now match (radio.py verify). */
+    ret = sys600_read_status(rig, rec);
+    if (ret != RIG_OK)
+    {
+        return ret;
+    }
+
+    sys600_decode_record(rec, &rx_hz, &tx_hz, &mode, &mem);
+    if (rx_hz != (uint32_t)freq)
+    {
+        rig_debug(RIG_DEBUG_ERR,
+                  "%s: set did not stick: asked %.0f Hz, radio reports %u Hz\n",
+                  __func__, (double)freq, (unsigned)rx_hz);
+        return -RIG_EPROTO;
+    }
+
+    return RIG_OK;
+}
+
+/*
+ * Get Rx/operating frequency: Status Update U=2 (19 bytes), frequency of
+ * the Rx sub-record d[10..18] (absolute offsets d[11..13], binary 10 Hz
+ * units - see codec).  Never U=0.
+ */
+static int system600_get_freq(RIG *rig, vfo_t vfo, freq_t *freq)
+{
+    uint8_t rec[SYS600_REC_LEN];
+    uint32_t hz;
+    int ret;
+
+    (void)vfo; /* single operating frequency, VFO-agnostic */
+
+    ret = sys600_read_status(rig, rec);
+    if (ret != RIG_OK)
+    {
+        return ret;
+    }
+
+    sys600_vfo_freq(rec + SYS600_REC_RX, &hz);
+    *freq = (freq_t)hz;
+    return RIG_OK;
+}
+
+/*
+ * Minimal registration (Task 4).  All fields dump_caps can touch are
+ * filled with honest provisional values; a later task refines them.
+ * Serial defaults: 4800 8N2 (SYS600_BAUD, radio.py:3-7/54-57) applied by
+ * the frontend from these caps fields (notes sec 1).
+ */
+struct rig_caps system600_caps =
+{
+    RIG_MODEL(RIG_MODEL_SYSTEM600),
+    .model_name =         "System 600",
+    .mfg_name =           "Yaesu",
+    .version =            "1.0",
+    .copyright =          "GPL",
+    /* No RIG_STATUS_OK in this enum; simulator-tested only, no hardware. */
+    .status =             RIG_STATUS_UNTESTED,
+    .rig_type =           RIG_TYPE_TRANSCEIVER,
+    .ptt_type =           RIG_PTT_NONE, /* set_ptt not wired until a later task */
+    .dcd_type =           RIG_DCD_NONE,
+    .port_type =          RIG_PORT_SERIAL,
+    .serial_rate_min =    SYS600_BAUD,
+    .serial_rate_max =    SYS600_BAUD,
+    .serial_data_bits =   8,
+    .serial_stop_bits =   2,
+    .serial_parity =      RIG_PARITY_NONE,
+    .serial_handshake =   RIG_HANDSHAKE_NONE,
+    .write_delay =        0,
+    .post_write_delay =   0,
+    .timeout =            SYS600_READ_TIMEOUT_MS,
+    .retry =              0,
+    .has_get_func =       RIG_FUNC_NONE,
+    .has_set_func =       RIG_FUNC_NONE,
+    .has_get_level =      RIG_LEVEL_NONE,
+    .has_set_level =      RIG_LEVEL_NONE,
+    .has_get_parm =       RIG_PARM_NONE,
+    .has_set_parm =       RIG_PARM_NONE,
+    .vfo_ops =            RIG_OP_NONE,
+    .scan_ops =           RIG_SCAN_NONE,
+    .targetable_vfo =     0,
+    .transceive =         RIG_TRN_OFF,
+    .preamp =             { RIG_DBLST_END, },
+    .attenuator =         { RIG_DBLST_END, },
+    .max_rit =            Hz(0),
+    .max_xit =            Hz(0),
+    .max_ifshift =        Hz(0),
+    .bank_qty =           0,
+    .chan_desc_sz =       0,
+    .chan_list =          { RIG_CHAN_END, },
+    .rx_range_list1 =     {
+        {kHz(100), MHz(30), SYSTEM600_MODES, -1, -1, RIG_VFO_A },
+        RIG_FRNG_END,
+    },
+    .tx_range_list1 =     {
+        {kHz(100), MHz(30), SYSTEM600_MODES, -1, -1, RIG_VFO_A },
+        RIG_FRNG_END,
+    },
+    .tuning_steps =       {
+        {SYSTEM600_MODES, Hz(1)},
+        RIG_TS_END,
+    },
+    .filters =            {
+        RIG_FLT_END,
+    },
+
+    .rig_open =           system600_open,
+    .rig_close =          system600_close,
+    .set_freq =           system600_set_freq,
+    .get_freq =           system600_get_freq,
+
+    .priv =               NULL,
+    .hamlib_check_rig_caps = HAMLIB_CHECK_RIG_CAPS
+};
+
+#endif /* SYSTEM600_CODEC_ONLY */
