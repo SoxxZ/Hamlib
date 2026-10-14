@@ -251,7 +251,7 @@ MISMATCH NOTE: `grep "#define RIG_OK\|…"` → no output; codes are members of 
   - `rig_set_ts`: `if (caps->set_ts == NULL) { RETURNFUNC(-RIG_ENAVAIL); }` — src/rig.c:6418-6421.
   - `rig_set_ant`: `if (caps->set_ant == NULL) { RETURNFUNC(-RIG_ENAVAIL); }` — src/rig.c:6572-6575.
 - ENIMPL-on-NULL exists ONLY for these (everything else defaults to ENAVAIL or OK):
-  - `set_ptt`: `if (caps->set_ptt == NULL) { … RETURNFUNC(-RIG_ENIMPL); }` — src/rig.c:3717-3719.
+  - `set_ptt`: `if (caps->set_ptt == NULL) { … RETURNFUNC(-RIG_ENIMPL); }` — src/rig.c:3715-3719 (if at :3715, return :3719).
   - `get_dcd`: `if (caps->get_dcd == NULL) { … RETURNFUNC(-RIG_ENIMPL); }` — src/rig.c:4356-4359.
   - split-VFO fallbacks (ternary): `retcode = caps->get_freq ? caps->get_freq(rig, RIG_VFO_CURR, tx_freq) : -RIG_ENIMPL;` — src/rig.c:5080-5081; `set_mode` src/rig.c:5326-5327; `get_mode` src/rig.c:5480-5481.
   - clock: `if (rig->caps->set_clock == NULL) { return -RIG_ENIMPL; }` — src/rig.c:8239-8241; `get_clock` src/rig.c:8259-8261.
@@ -260,10 +260,16 @@ MISMATCH NOTE: `grep "#define RIG_OK\|…"` → no output; codes are members of 
   - `rig_open`: NULL hook skipped — `if (caps->rig_open != NULL)` src/rig.c:1506, call `status = caps->rig_open(rig);` src/rig.c:1536.
   - `rig_close`: NULL hook skipped, return code ignored — `if (caps->rig_close)` src/rig.c:1791.
   - `get_ptt`: `if (!caps->get_ptt) { *ptt = rs->transmit ? RIG_PTT_ON : RIG_PTT_OFF; … RETURNFUNC(RIG_OK); }` — src/rig.c:4067-4071.
-- has_* masks DO affect error returns (not just advertising): `rig_set_level`: `if (caps->set_level == NULL || !rig_has_set_level(rig, level)) { return -RIG_ENAVAIL; }` — src/settings.c:90-93; `rig_get_level`: `if (caps->get_level == NULL || !rig_has_get_level(rig, level)) { return -RIG_ENAVAIL; }` — src/settings.c:180-183. Client side too: `if (!rig_has_set_level(rig, level)) … RETURNFUNC2(-RIG_ENAVAIL);` — tests/rigctl_parse.c:3698-3706; `if (!rig_has_get_level(rig, level))` → -RIG_ENAVAIL — tests/rigctl_parse.c:3804. ⇒ A level not listed in `has_get_level`/`has_set_level` yields **RPRT -11 (ENAVAIL)**, never -4.
+- has_* masks DO affect error returns, but the yield differs by layer (fix round 2 — all lines sed-verified):
+  - API `rig_set_level`: `if (caps->set_level == NULL || !rig_has_set_level(rig, level)) { return -RIG_ENAVAIL; }` — src/settings.c:90-92 (guard :90, return :92).
+  - API `rig_get_level`: `if (caps->get_level == NULL || !rig_has_get_level(rig, level)) { return -RIG_ENAVAIL; }` — src/settings.c:180-182 (guard :180, return :182).
+  - client `l <level>` **SET**, has-bit missing, non-ext level: `if (!rig_has_set_level(rig, level)) { … if (!cfp) { RETURNFUNC2(-RIG_ENAVAIL); } }` — tests/rigctl_parse.c:3700→3708 ⇒ wire **RPRT -11**.
+  - client `l <level>` **GET**, has-bit missing, **non-ext level**: `if (!rig_has_get_level(rig, level)) { … if (!cfp) { … RETURNFUNC2(-RIG_EINVAL); } }` — tests/rigctl_parse.c:3804-3813 (guard :3804, `if (!cfp)` :3810, return :3813) ⇒ wire **RPRT -1** (-RIG_EINVAL), NOT -11.
+  - client `l <level>` GET, has-bit missing but level IS a registered ext level (`cfp` found): falls through to `status = rig_get_ext_level(rig, vfo, cfp->token, &val);` and returns that status verbatim (`if (status != RIG_OK) { RETURNFUNC2(status); }`) — tests/rigctl_parse.c:3816-3820 ⇒ yield = whatever `rig_get_ext_level` returns (has-bit no longer consulted).
+  - None of these paths ever returns -4 (ENIMPL).
 - No `has_*` mask→ENIMPL check exists in src/rig.c (kept TRUE); `has_get_level` is only copied and auto-adds STRENGTH when RAWSTR+str_cal present: `rs->has_get_level = caps->has_get_level;` src/rig.c:972; `if ((caps->has_get_level & RIG_LEVEL_STRENGTH) == 0 && (caps->has_get_level & RIG_LEVEL_RAWSTR) == RIG_LEVEL_RAWSTR && caps->str_cal.size) { rs->has_get_level |= RIG_LEVEL_STRENGTH; }` src/rig.c:978-983.
-- Missing `targetable_vfo` bit does NOT yield ENIMPL: when the PTT-targetable condition `if ((caps->targetable_vfo & RIG_TARGETABLE_PTT) || vfo == RIG_VFO_CURR || vfo == rig_get_current_vfo_state(rig))` (src/rig.c:3722) fails, the frontend falls back to VFO-swap; if `caps->set_vfo` is NULL in that path → `-RIG_ENAVAIL` — src/rig.c:3773-3777. (The :3719 ENIMPL is the separate `caps->set_ptt == NULL` guard at :3717-3720, not the targetable check.)
-- Wire rule for system600 downstream assertions: missing/unsupported hook or unadvertised has_* bit → frontend default **-11 (ENAVAIL)**; **-4 (ENIMPL)** only in the enumerated set_ptt/get_dcd/split-fallback/clock/port-type cases; a backend-registered hook must itself `return -RIG_ENIMPL;` for unsupported args (frg9600 idiom: `return -RIG_EINVAL;` for wrong MODE, rigs/yaesu/frg9600.c:189).
+- Missing `targetable_vfo` bit does NOT yield ENIMPL: when the PTT-targetable condition `if ((caps->targetable_vfo & RIG_TARGETABLE_PTT) || vfo == RIG_VFO_CURR || vfo == rig_get_current_vfo_state(rig))` (src/rig.c:3722) fails, the frontend falls back to VFO-swap; if `caps->set_vfo` is NULL in that path → `-RIG_ENAVAIL` — src/rig.c:3772-3776 (`if (!caps->set_vfo)` :3772, return :3776). (The :3719 ENIMPL is the separate `caps->set_ptt == NULL` guard at :3715-3720, not the targetable check.)
+- Wire rule for system600 downstream assertions: missing/unsupported hook or unadvertised has_* bit → frontend default **-11 (ENAVAIL)** for API calls and client SET (with the client GET non-ext-level exception: **-1 (EINVAL)**, tests/rigctl_parse.c:3813); **-4 (ENIMPL)** only in the enumerated set_ptt/get_dcd/split-fallback/clock/port-type cases; a backend-registered hook must itself `return -RIG_ENIMPL;` for unsupported args (frg9600 idiom: `return -RIG_EINVAL;` for wrong MODE, rigs/yaesu/frg9600.c:189).
 
 ## 5. Registration checklist
 
