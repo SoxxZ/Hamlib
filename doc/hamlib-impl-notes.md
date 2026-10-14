@@ -44,6 +44,8 @@ All refs are `file:line` in this repo. Zero prose beyond fact lines.
   ```
   → 4800 8N2 model default lives in `serial_*` caps fields (frg9600.c:59-64).
 - `rig_set_conf` override mechanism: NOT FOUND — tried `grep -n "write_block\|read_string\|serial_open\|port_open\|rig_set_conf\|4800\|parity" rigs/yaesu/frg9600.c` (only write_block + caps defaults hit) and `grep -n "set_conf\|RIG_CONF\|confparm\|port settings\|serial settings" README.developer` (no hits).
+- (Supplement) Prototype location confirmed: `write_block`/`read_string` are declared ONLY in the private `src/iofunc.h` (39, 43, 47, 53, 61), not in `include/hamlib/`; `grep -rn "write_block\|read_string" include/ src/` hits headers exactly at src/iofunc.h:39/43/47 (write_block family) and src/iofunc.h:53/61 (read_string family); implementation `read_string_generic` src/iofunc.c:1312.
+- (Supplement) How frg9600 reads replies: **it doesn't** — `grep -in "read\|frame\|recv" rigs/yaesu/frg9600.c` matches only the comment at frg9600.c:43 ("Also this struct is READONLY!"). FRG9600 is write-only: caps registers only `.set_freq` and `.set_mode` (frg9600.c:128-129), no get_* hooks, so no read idiom exists there. Read idiom reference (netrigctl, verbatim): `ret = read_string(rp, (unsigned char *) buf, BUF_MAX, "\n", 1, 0, 1);` — rigs/dummy/netrigctl.c:326 (stopset `"\n"`, stopset_len 1, flush_flag 0, expected_len 1).
 
 ## 2. Required rig_caps fields
 
@@ -191,7 +193,7 @@ API hooks — 17+ required per Task (rig.h:2469+):
 - `read_frame_direct` → rig.h:2640-2643 → system600: 0/NULL
 - `is_async_frame` → rig.h:2644-2647 → system600: 0/NULL
 - `process_async_frame` → rig.h:2648-2651 → system600: 0/NULL
-- `hamlib_check_rig_caps` → `char *` (integrity check field, rig.h comment "a constant value we can check for hamlib integrity") → system600: set via initializer pattern used by other backends (copy from template)
+- `hamlib_check_rig_caps` → `char *` (integrity check field, rig.h comment "a constant value we can check for hamlib integrity") → system600: `HAMLIB_CHECK_RIG_CAPS` — idiom verbatim: `.hamlib_check_rig_caps = HAMLIB_CHECK_RIG_CAPS` rigs/yaesu/frg9600.c:131; macro `#define HAMLIB_CHECK_RIG_CAPS "HAMLIB_CHECK_RIG_CAPS"` rig.h:2334
 - `get_conf2` → `int (*)(RIG *, hamlib_token_t, char *, int)` → system600: 0/NULL
 - `password` → `int (*)(RIG *, const char *key1)` → system600: 0/NULL
 - `set_lock_mode`/`get_lock_mode` → system600: 0/NULL
@@ -252,6 +254,11 @@ MISMATCH NOTE: `grep "#define RIG_OK\|…"` → no output; codes are members of 
   ```
   same pattern src/rig.c:8259-8261 (`get_clock`). Other frontend ENIMPL returns: src/rig.c:1041 (doc: "port type communication is not implemented yet"), 2837, 3719, 4359, 5081, 5327, 5481.
 - has_* mask → ENIMPL verbatim line: NOT FOUND — tried `grep -n "ENIMPL" src/rig.c | head -12`; hits are NULL-hook and path returns above, no `has_get_level`-mask check captured in one attempt. Backend rule: a backend that does not implement a NULLed-out hook gets `-RIG_ENIMPL` from the frontend for free; if it registers a hook it must itself `return -RIG_ENIMPL;` for unsupported args (frg9600.c idiom: `return -RIG_EINVAL;` for wrong MODE, rigs/yaesu/frg9600.c:189).
+- (Supplement) Actual frontend ENIMPL mechanism (verified `grep -n -B3 -A6 "RIG_ENIMPL" src/rig.c`) — the frontend returns `-RIG_ENIMPL` WITHOUT calling the backend in three cases:
+  1. caps hook pointer is NULL (ternary guard): `retcode = caps->get_freq ? caps->get_freq(rig, RIG_VFO_CURR, tx_freq) : -RIG_ENIMPL;` — src/rig.c:5080-5081 (split-freq get path); identical guards for `set_mode` src/rig.c:5326-5327 and `get_mode` src/rig.c:5480-5481; `if (rig->caps->set_clock == NULL) { return -RIG_ENIMPL; }` src/rig.c:8239-8241 (rig_set_clock) and get_clock src/rig.c:8259-8261; `if (caps->get_dcd == NULL) { … RETURNFUNC(-RIG_ENIMPL); }` src/rig.c:4356-4359.
+  2. caps `targetable_vfo` bitmask lacks the needed capability: ENIMPL returned in the block whose guard is `if ((caps->targetable_vfo & RIG_TARGETABLE_PTT) || vfo == RIG_VFO_CURR || …)` failing — src/rig.c:3719 with condition at :3722 (same idiom :4074).
+  3. unimplemented port type in `rig_open`: doc `\retval -RIG_ENIMPL   port type communication is not implemented yet.` src/rig.c:1041 (function `rig_open` at :1045).
+  No `has_get_*`/`has_set_*` mask→ENIMPL check was found in src/rig.c in the greps performed; the has_* masks gate which levels/funcs the frontend advertises, while the NULL-hook/targetable_vfo checks above are what produce -RIG_ENIMPL.
 
 ## 5. Registration checklist
 
@@ -280,6 +287,7 @@ FT600 (index 39) exact pattern lines — 3 edits + makefile:
 
 New lines to add for SYSTEM600 (index 52):
 
+- (Supplement) **index 52 verified free in-tree** — `grep -n "RIG_YAESU, 5[0-9]" include/hamlib/riglist.h` returns only `riglist.h:176:#define RIG_MODEL_FT9000OLD RIG_MAKE_MODEL(RIG_YAESU, 50)` and `riglist.h:177:#define RIG_MODEL_FTX1 RIG_MAKE_MODEL(RIG_YAESU, 51)`; last used: 51 FTX1, riglist.h:177. No `RIG_YAESU, 52` exists.
 - riglist.h (after neighbors of :165): `#define RIG_MODEL_SYSTEM600 RIG_MAKE_MODEL(RIG_YAESU, 52)`  ← skeleton ruling: index 52; backend macro `RIG_YAESU` assumed from the FT600 template hits (verify if system600 gets its own backend).
 - yaesu.h (after :56): `extern struct rig_caps system600_caps;`
 - yaesu.c (in initrigs_yaesu list, near :86): `rig_register(&system600_caps);`
@@ -302,4 +310,13 @@ New lines to add for SYSTEM600 (index 52):
 - RPRT format — rigctld.1:67-70: on error, one line `RPRT x` where x is the negative error code; valueless commands reply `RPRT x` with x=0 on success; each line terminated with `\n`. rigctld.1:2066-2068: set commands → one line `RPRT x\n`, x=0 success. rigctld.1:2076-2079: get commands → text values one per line; on error `RPRT x\n`.
 - Extended Response Protocol — rigctld.1:78-81: echoes the received command string as a header, returned values as key: value pairs, `RPRT x` as end-of-response marker; rigctld.1:2125-2131: first record = long command name + value(s) terminated by response separator, last record = `RPRT x\n`. Separator examples: `get_mode:;Mode: USB;Passband: 2400;RPRT 0` (rigctld.1:2242), `|` variant (rigctld.1:2252).
 - rigctl model selection — doc/man1/rigctl.1:78-79: `-m, --model = id` — "Select radio model number. Defaults to dummy rig."; rigctl.1:81: "See model list (use `rigctl -l`)."
-- Enforceable coding rules used for the backend (README.coding_style §2, head -40): no tabs for indentation (spaces only, ASCII 0x20); **indentation = 4 spaces**; "Bare conditionals shall be avoided. All conditionals--'if', 'else', 'for', 'while', and 'do while' shall have their statements enclosed in braces."; README.coding_style:113: "No space between a function name and its opening parentheses." Naming conventions: NOT FOUND — tried `grep -n "naming\|Naming\|CamelCase\|snake"` and `grep -n "identifier\|variable name\|function name\|lowercase\|Capitaliz\|capitaliz" README.coding_style`.
+- Enforceable coding rules used for the backend (README.coding_style §2, head -40): no tabs for indentation (spaces only, ASCII 0x20); **indentation = 4 spaces**; "Bare conditionals shall be avoided. All conditionals--'if', 'else', 'for', 'while', and 'do while' shall have their statements enclosed in braces."; README.coding_style:113: "No space between a function name and its opening parentheses." Naming conventions: NOT FOUND — tried `grep -n "naming\|Naming\|CamelCase\|snake"` and `grep -n "identifier\|variable name\|function name\|lowercase\|Capitaliz\|capitaliz" README.coding_style` (Supplement §7: confirmed no identifier-naming scheme exists; only paren/pointer spacing rules).
+
+## 7. Style rules (README.coding_style, enforceable only)
+
+- No tab characters (0x09) for indentation/alignment — spaces (0x20) only; `'\t'` allowed in rig_debug()/static strings — README.coding_style:24-28.
+- Indentation shall be 4 spaces — README.coding_style:30-31.
+- All conditionals (`if`, `else`, `for`, `while`, `do while`) shall have their statements enclosed in braces ("bare conditionals" avoided; rare exceptions per §2 NOTE) — README.coding_style:39-43.
+- No space between a function name and its opening parenthesis — README.coding_style:113.
+- No space between pointer operator `*` and the pointer name — README.coding_style:115-116.
+- Identifier naming conventions: NOT FOUND — grep naming/CamelCase/snake/identifier/variable name/function name/lowercase/Capitaliz + read of sections 0–3.4; only the two pointer/paren spacing rules above govern names/spacing.
