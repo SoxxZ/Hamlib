@@ -330,6 +330,13 @@ static int system600_set_vfo(RIG *rig, vfo_t vfo);
 static int system600_get_vfo(RIG *rig, vfo_t *vfo);
 static int system600_set_ptt(RIG *rig, vfo_t vfo, ptt_t ptt);
 static int system600_get_ptt(RIG *rig, vfo_t vfo, ptt_t *ptt);
+static int system600_set_split_vfo(RIG *rig, vfo_t vfo, split_t split, vfo_t tx_vfo);
+static int system600_get_split_vfo(RIG *rig, vfo_t vfo, split_t *split, vfo_t *tx_vfo);
+static int system600_set_split_freq(RIG *rig, vfo_t vfo, freq_t freq);
+static int system600_get_split_freq(RIG *rig, vfo_t vfo, freq_t *freq);
+static int system600_set_rit(RIG *rig, vfo_t vfo, shortfreq_t rit);
+static int system600_get_rit(RIG *rig, vfo_t vfo, shortfreq_t *rit);
+static int system600_vfo_op(RIG *rig, vfo_t vfo, vfo_op_t op);
 
 /*
  * Per-instance private data, allocated in system600_init and released in
@@ -883,6 +890,228 @@ static int system600_set_ptt(RIG *rig, vfo_t vfo, ptt_t ptt)
 }
 
 /*
+ * Set Split VFO: RIG_SPLIT_OFF -> Rx->Tx copy (85h). RIG_SPLIT_ON -> accept
+ * no-op (tx freq set separately). tx_vfo is ignored for this radio.
+ */
+static int system600_set_split_vfo(RIG *rig, vfo_t vfo, split_t split, vfo_t tx_vfo)
+{
+    uint8_t frame[SYS600_FRAME_LEN];
+
+    (void)vfo;
+    (void)tx_vfo;
+
+    if (split == RIG_SPLIT_OFF)
+    {
+        sys600_frame(SYS600_OP_RX_TO_TX, 0, 0, 0, 0, frame);
+        return write_block(RIGPORT(rig), frame, SYS600_FRAME_LEN);
+    }
+    else if (split == RIG_SPLIT_ON)
+    {
+        return RIG_OK;
+    }
+
+    return -RIG_EINVAL;
+}
+
+/*
+ * Get Split VFO: infer split if Tx freq differs from Rx freq.
+ * Returns RIG_SPLIT_ON if tx_hz != rx_hz, else RIG_SPLIT_OFF.
+ * tx_vfo returned as RIG_VFO_A (single operating VFO).
+ */
+static int system600_get_split_vfo(RIG *rig, vfo_t vfo, split_t *split, vfo_t *tx_vfo)
+{
+    uint8_t rec[SYS600_REC_LEN];
+    uint32_t rx_hz, tx_hz;
+    uint8_t mode, mem;
+    int ret;
+
+    (void)vfo;
+
+    ret = sys600_read_status(rig, rec);
+    if (ret != RIG_OK)
+    {
+        return ret;
+    }
+
+    sys600_decode_record(rec, &rx_hz, &tx_hz, &mode, &mem);
+
+    if (tx_hz != rx_hz)
+    {
+        *split = RIG_SPLIT_ON;
+    }
+    else
+    {
+        *split = RIG_SPLIT_OFF;
+    }
+    *tx_vfo = RIG_VFO_A;
+
+    return RIG_OK;
+}
+
+/*
+ * Set Tx frequency (8Ah, BCD) for split operation.
+ * Read-back verification against Tx sub-record.
+ */
+static int system600_set_split_freq(RIG *rig, vfo_t vfo, freq_t freq)
+{
+    uint8_t frame[SYS600_FRAME_LEN];
+    uint8_t bcd[4];
+    uint8_t rec[SYS600_REC_LEN];
+    uint8_t mode, mem;
+    uint32_t rx_hz, tx_hz;
+    int ret;
+
+    (void)vfo;
+
+    if (!(freq >= (freq_t)SYS600_FREQ_MIN_HZ &&
+            freq <= (freq_t)SYS600_FREQ_MAX_HZ))
+    {
+        return -RIG_EINVAL;
+    }
+
+    if (sys600_freq_to_bcd((uint32_t)freq, bcd) != 0)
+    {
+        return -RIG_EINVAL;
+    }
+
+    sys600_frame(SYS600_OP_SET_TX_FREQ, bcd[0], bcd[1], bcd[2], bcd[3], frame);
+    ret = write_block(RIGPORT(rig), frame, SYS600_FRAME_LEN);
+    if (ret != RIG_OK)
+    {
+        return ret;
+    }
+
+    ret = sys600_read_status(rig, rec);
+    if (ret != RIG_OK)
+    {
+        return ret;
+    }
+
+    sys600_decode_record(rec, &rx_hz, &tx_hz, &mode, &mem);
+    if (tx_hz != (uint32_t)freq)
+    {
+        rig_debug(RIG_DEBUG_ERR,
+                  "%s: set did not stick: asked %.0f Hz, radio reports %u Hz\n",
+                  __func__, (double)freq, (unsigned)tx_hz);
+        return -RIG_EPROTO;
+    }
+
+    return RIG_OK;
+}
+
+/*
+ * Get Tx frequency from Status Update U=2 (Tx sub-record).
+ */
+static int system600_get_split_freq(RIG *rig, vfo_t vfo, freq_t *freq)
+{
+    uint8_t rec[SYS600_REC_LEN];
+    uint32_t rx_hz, tx_hz;
+    uint8_t mode, mem;
+    int ret;
+
+    (void)vfo;
+
+    ret = sys600_read_status(rig, rec);
+    if (ret != RIG_OK)
+    {
+        return ret;
+    }
+
+    sys600_decode_record(rec, &rx_hz, &tx_hz, &mode, &mem);
+    *freq = (freq_t)tx_hz;
+    return RIG_OK;
+}
+
+/*
+ * Set RIT: Carrier (50h), 16-bit BINARY twos-complement in 10 Hz units
+ * (NOT BCD despite the manual - protocol.py:365-381 carrier_frame; agent ref
+ * sec 17.3).  Wire order is [F2][F1][S][W][0x50] where F1:F2 is the big-endian
+ * 16-bit value, S=1 (set now), W=0.  Worked example from the brief:
+ * +1.5k -> +1500 Hz = +150 units = 0x0096 -> 96 00 01 00 50.
+ * The carrier offset is not echoed in the status record, so the value is
+ * cached in priv for get_rit (brief line 5).
+ */
+static int system600_set_rit(RIG *rig, vfo_t vfo, shortfreq_t rit)
+{
+    uint8_t frame[SYS600_FRAME_LEN];
+    int32_t units;
+    uint16_t value;
+    uint8_t f1, f2;
+    struct sys600_priv *p = (struct sys600_priv *)STATE(rig)->priv;
+    int ret;
+
+    (void)vfo;
+
+    /* round(rit / 10) half away from zero, matching protocol.py carrier_frame. */
+    units = (rit >= 0) ? ((int32_t)rit + 5) / 10 : ((int32_t)rit - 5) / 10;
+
+    if (units < -32768)
+    {
+        units = -32768;
+    }
+    if (units > 32767)
+    {
+        units = 32767;
+    }
+
+    value = (uint16_t)(units & 0xFFFF);
+    f1 = (uint8_t)((value >> 8) & 0xFF);
+    f2 = (uint8_t)(value & 0xFF);
+
+    /* Wire: [P4][P3][P2][P1][OPCODE] = [f2][f1][s=1][w=0][0x50] */
+    sys600_frame(SYS600_OP_CARRIER, 0, 1, f1, f2, frame);
+    ret = write_block(RIGPORT(rig), frame, SYS600_FRAME_LEN);
+    if (ret == RIG_OK && p != NULL)
+    {
+        p->rit_hz = (int)(units * 10);  /* cache the value actually sent */
+        p->rit_valid = 1;
+    }
+    return ret;
+}
+
+/*
+ * Get RIT: return cached value from priv (carrier offset not in status record).
+ */
+static int system600_get_rit(RIG *rig, vfo_t vfo, shortfreq_t *rit)
+{
+    struct sys600_priv *p = (struct sys600_priv *)STATE(rig)->priv;
+
+    (void)vfo;
+
+    if (p == NULL || !p->rit_valid)
+    {
+        *rit = 0;
+        return RIG_OK;
+    }
+
+    *rit = (shortfreq_t)p->rit_hz;
+    return RIG_OK;
+}
+
+/*
+ * VFO OP: support RIG_OP_UP / RIG_OP_DOWN via 8Eh.
+ */
+static int system600_vfo_op(RIG *rig, vfo_t vfo, vfo_op_t op)
+{
+    uint8_t frame[SYS600_FRAME_LEN];
+
+    (void)vfo;
+
+    if (op == RIG_OP_UP)
+    {
+        sys600_frame(SYS600_OP_STEP, 0, 0, 0, 0, frame);
+        return write_block(RIGPORT(rig), frame, SYS600_FRAME_LEN);
+    }
+    else if (op == RIG_OP_DOWN)
+    {
+        sys600_frame(SYS600_OP_STEP, 1, 0, 0, 0, frame);
+        return write_block(RIGPORT(rig), frame, SYS600_FRAME_LEN);
+    }
+
+    return -RIG_EINVAL;
+}
+
+/*
  * Get PTT: Read Flags (FAh), Flag2 bit0 = PTT closed by CAT command
  * (task-5-brief line 8; protocol.py:257 FLAG_F2_PTT_CAT).
  */
@@ -941,14 +1170,19 @@ struct rig_caps system600_caps =
     .has_set_level =      RIG_LEVEL_NONE,
     .has_get_parm =       RIG_PARM_NONE,
     .has_set_parm =       RIG_PARM_NONE,
-    .vfo_ops =            RIG_OP_NONE,
+    .vfo_ops =            RIG_OP_UP | RIG_OP_DOWN,
     .scan_ops =           RIG_SCAN_NONE,
-    .targetable_vfo =     0,
+    /* The rig exposes its Tx frequency independently (8Ah / U=2 Tx sub-record),
+     * so split set/get route straight through instead of a VFO-swap dance (a
+     * single-VFO rig cannot swap).  frg9600 precedent. */
+    .targetable_vfo =     RIG_TARGETABLE_FREQ,
     .transceive =         RIG_TRN_OFF,
     .preamp =             { RIG_DBLST_END, },
     .attenuator =         { RIG_DBLST_END, },
-    .max_rit =            Hz(0),
+    /* Carrier (50h) offset is 16-bit binary in 10 Hz units: +/-327670 Hz. */
+    .max_rit =            Hz(327670),
     .max_xit =            Hz(0),
+    .max_ifshift =        Hz(0),
     .max_ifshift =        Hz(0),
     .bank_qty =           0,
     .chan_desc_sz =       0,
@@ -981,6 +1215,13 @@ struct rig_caps system600_caps =
     .get_vfo =            system600_get_vfo,
     .set_ptt =            system600_set_ptt,
     .get_ptt =            system600_get_ptt,
+    .set_split_vfo =      system600_set_split_vfo,
+    .get_split_vfo =      system600_get_split_vfo,
+    .set_split_freq =     system600_set_split_freq,
+    .get_split_freq =     system600_get_split_freq,
+    .set_rit =            system600_set_rit,
+    .get_rit =            system600_get_rit,
+    .vfo_op =             system600_vfo_op,
 
     /* Per-instance priv data is calloc'ed in system600_init into
      * STATE(rig)->priv; this caps-level slot stays NULL (ft817 idiom). */
