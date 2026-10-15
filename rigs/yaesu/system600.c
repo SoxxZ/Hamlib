@@ -21,7 +21,10 @@
 #include <string.h>
 
 #ifndef SYSTEM600_CODEC_ONLY
+#include <stdlib.h>     /* calloc/free for the priv data (ft817 idiom) */
+
 #include "hamlib/rig.h"
+#include "hamlib/rig_state.h"  /* STATE(rig)->priv (ft817_init idiom) */
 #include "iofunc.h"
 #include "misc.h"
 #endif
@@ -314,10 +317,34 @@ static SYS600_UNUSED_FN int sys600_mode_status_to_cmd(uint8_t status, uint8_t *c
                          RIG_MODE_AM | RIG_MODE_PKTLSB | RIG_MODE_PKTUSB)
 
 static int sys600_read_status(RIG *rig, uint8_t rec[SYS600_REC_LEN]);
+static int sys600_read_flags(RIG *rig, struct sys600_flags *flags);
+static int system600_init(RIG *rig);
+static int system600_cleanup(RIG *rig);
 static int system600_open(RIG *rig);
 static int system600_close(RIG *rig);
 static int system600_set_freq(RIG *rig, vfo_t vfo, freq_t freq);
 static int system600_get_freq(RIG *rig, vfo_t vfo, freq_t *freq);
+static int system600_set_mode(RIG *rig, vfo_t vfo, rmode_t mode, pbwidth_t width);
+static int system600_get_mode(RIG *rig, vfo_t vfo, rmode_t *mode, pbwidth_t *width);
+static int system600_set_vfo(RIG *rig, vfo_t vfo);
+static int system600_get_vfo(RIG *rig, vfo_t *vfo);
+static int system600_set_ptt(RIG *rig, vfo_t vfo, ptt_t ptt);
+static int system600_get_ptt(RIG *rig, vfo_t vfo, ptt_t *ptt);
+
+/*
+ * Per-instance private data, allocated in system600_init and released in
+ * system600_cleanup (ft817_init/cleanup idiom: rigs/yaesu/ft817.c:622-646,
+ * STATE(rig)->priv).  j2b_sideband caches the last PKTLSB/PKTUSB mode set:
+ * the status mode byte cannot encode the J2B sideband (it lives in Flag2,
+ * agent ref sec 17.10), so a get_mode on status 5 needs the last-set value.
+ * rit_* is the reserved slot for Task 6's RIT cache.
+ */
+struct sys600_priv {
+    rmode_t j2b_sideband;       /* last-set RIG_MODE_PKTLSB / RIG_MODE_PKTUSB */
+    int j2b_sideband_valid;     /* j2b_sideband holds a set value */
+    int rit_hz;                 /* Task 6 slot: cached RIT offset, Hz */
+    int rit_valid;              /* Task 6 slot: rit_hz holds a value */
+};
 
 /*
  * Status Update (10h) with U=2: request, then read exactly the 19-byte
@@ -370,6 +397,88 @@ static int sys600_read_status(RIG *rig, uint8_t rec[SYS600_REC_LEN])
     }
 
     memcpy(rec, buf, SYS600_REC_LEN);
+    return RIG_OK;
+}
+
+/*
+ * Read Flags (FAh): flush, write the 5-byte request, read exactly the
+ * 5-byte reply, decode with the codec's tail-checked decoder.  Mirrors
+ * radio.py:135-137 (read_flags via _query) with the read_block primitive
+ * (see sys600_read_status for why read_string is never used on binary).
+ * Returns RIG_OK, -RIG_ETIMEOUT on timeout, -RIG_EPROTO on a short reply
+ * or a bad 06 04 tail, or the write_block error verbatim.
+ */
+static int sys600_read_flags(RIG *rig, struct sys600_flags *flags)
+{
+    uint8_t frame[SYS600_FRAME_LEN];
+    uint8_t buf[SYS600_FLAGS_REPLY_LEN];
+    int ret;
+
+    sys600_frame(SYS600_OP_READ_FLAGS, 0, 0, 0, 0, frame);
+
+    /* Drop stale bytes so we stay aligned (radio.py:117 reset_input_buffer). */
+    rig_flush(RIGPORT(rig));
+
+    ret = write_block(RIGPORT(rig), frame, SYS600_FRAME_LEN);
+    if (ret != RIG_OK)
+    {
+        return ret;
+    }
+
+    ret = read_block(RIGPORT(rig), buf, SYS600_FLAGS_REPLY_LEN);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    if (ret != SYS600_FLAGS_REPLY_LEN)
+    {
+        rig_debug(RIG_DEBUG_ERR,
+                  "%s: short flags reply: expected %d bytes, got %d\n",
+                  __func__, SYS600_FLAGS_REPLY_LEN, ret);
+        return -RIG_EPROTO;
+    }
+
+    if (sys600_decode_flags(buf, flags) != 0)
+    {
+        rig_debug(RIG_DEBUG_ERR, "%s: bad flags reply tail\n", __func__);
+        return -RIG_EPROTO;
+    }
+
+    return RIG_OK;
+}
+
+/*
+ * Init: allocate the per-instance priv data (ft817_init idiom,
+ * rigs/yaesu/ft817.c:622-636).  calloc zeroes everything: j2b_sideband
+ * starts "never set" so get_mode reports PKTUSB until a PKTLSB/PKTUSB
+ * set_mode teaches us the sideband (task-5-brief line 5).
+ */
+static int system600_init(RIG *rig)
+{
+    rig_debug(RIG_DEBUG_VERBOSE, "%s: called, version %s\n", __func__,
+              rig->caps->version);
+
+    if ((STATE(rig)->priv = calloc(1, sizeof(struct sys600_priv))) == NULL)
+    {
+        return -RIG_ENOMEM;
+    }
+
+    return RIG_OK;
+}
+
+/*
+ * Cleanup: release the priv data (ft817_cleanup idiom,
+ * rigs/yaesu/ft817.c:638-646).  rig_cleanup's return code is ignored by
+ * the frontend (doc/hamlib-impl-notes.md sec 4).
+ */
+static int system600_cleanup(RIG *rig)
+{
+    rig_debug(RIG_DEBUG_VERBOSE, "%s: called\n", __func__);
+
+    free(STATE(rig)->priv);
+    STATE(rig)->priv = NULL;
+
     return RIG_OK;
 }
 
@@ -500,6 +609,304 @@ static int system600_get_freq(RIG *rig, vfo_t vfo, freq_t *freq)
 }
 
 /*
+ * =====================================================================
+ * Task 5: mode / VFO / PTT callbacks.  Semantics from ft600rig/radio.py
+ * (set/get_mode 189-222, set/get_ptt 224-231, set/get_vfo 233-249).
+ * =====================================================================
+ */
+
+/*
+ * Map a Hamlib mode + width to a MODE (0Ch) command byte
+ * (radio.py:189-192 set_mode: narrow = 0 < passband <= 900; passband <= 0
+ * selects the wide variant).  The radio has no CWR/RTTY/... modes: any
+ * rmode outside the CAT table is rejected with -RIG_EINVAL (frg9600.c:189
+ * idiom per notes sec 4).
+ */
+static int sys600_rmode_to_cmd(rmode_t mode, pbwidth_t width, uint8_t *cmd)
+{
+    int narrow = (width > 0 && width <= SYS600_NARROW_MAX_HZ);
+
+    switch (mode)
+    {
+    case RIG_MODE_LSB:
+        *cmd = SYS600_MODE_CMD_LSB;
+        return 0;
+
+    case RIG_MODE_USB:
+        *cmd = SYS600_MODE_CMD_USB;
+        return 0;
+
+    case RIG_MODE_CW:
+        *cmd = narrow ? SYS600_MODE_CMD_CW_N : SYS600_MODE_CMD_CW_W;
+        return 0;
+
+    case RIG_MODE_AM:
+        *cmd = SYS600_MODE_CMD_AM;
+        return 0;
+
+    case RIG_MODE_PKTLSB:
+        *cmd = narrow ? SYS600_MODE_CMD_J2B_LSB_N : SYS600_MODE_CMD_J2B_LSB_W;
+        return 0;
+
+    case RIG_MODE_PKTUSB:
+        *cmd = narrow ? SYS600_MODE_CMD_J2B_USB_N : SYS600_MODE_CMD_J2B_USB_W;
+        return 0;
+
+    default:
+        return -1;
+    }
+}
+
+/*
+ * Set operating mode (0Ch) with read-back verification
+ * (radio.py:193-196: re-read the status mode byte; the radio silently
+ * ignores out-of-range commands, so a set that does not stick is
+ * -RIG_EPROTO).  The status byte cannot encode the J2B sideband, so the
+ * verify compares mode-family status codes (the J2B wide/narrow/sideband
+ * command codes all collapse to status 05 - codec trap, protocol.py:66-84).
+ * On a successful PKTLSB/PKTUSB set the sideband is cached in priv data
+ * for get_mode (status 5 ambiguity, agent ref sec 17.10).
+ */
+static int system600_set_mode(RIG *rig, vfo_t vfo, rmode_t mode, pbwidth_t width)
+{
+    uint8_t frame[SYS600_FRAME_LEN];
+    uint8_t cmd, want_status, rec[SYS600_REC_LEN];
+    struct sys600_priv *p = (struct sys600_priv *)STATE(rig)->priv;
+    int ret;
+
+    (void)vfo; /* 0Ch always targets the current operating mode */
+
+    if (sys600_rmode_to_cmd(mode, width, &cmd) != 0)
+    {
+        rig_debug(RIG_DEBUG_ERR, "%s: unsupported mode 0x%x\n", __func__,
+                  (unsigned)mode);
+        return -RIG_EINVAL;
+    }
+
+    sys600_frame(SYS600_OP_MODE, cmd, 0, 0, 0, frame);
+    ret = write_block(RIGPORT(rig), frame, SYS600_FRAME_LEN);
+    if (ret != RIG_OK)
+    {
+        return ret;
+    }
+
+    ret = sys600_read_status(rig, rec);
+    if (ret != RIG_OK)
+    {
+        return ret;
+    }
+
+    /* cmd is always table-valid here; belt and braces. */
+    if (sys600_mode_cmd_to_status(cmd, &want_status) != 0)
+    {
+        return -RIG_EINVAL;
+    }
+
+    if (rec[SYS600_REC_RX_MODE] != want_status)
+    {
+        rig_debug(RIG_DEBUG_ERR,
+                  "%s: set did not stick: asked status mode 0x%x, radio reports 0x%x\n",
+                  __func__, (unsigned)want_status,
+                  (unsigned)rec[SYS600_REC_RX_MODE]);
+        return -RIG_EPROTO;
+    }
+
+    if (p != NULL &&
+            (mode == RIG_MODE_PKTLSB || mode == RIG_MODE_PKTUSB))
+    {
+        p->j2b_sideband = mode;
+        p->j2b_sideband_valid = 1;
+    }
+
+    return RIG_OK;
+}
+
+/*
+ * Get operating mode + passband.  The status mode byte selects the mode
+ * family (protocol.py:115-122 STATUS_MODE_TO_TOKEN); status 5 (J2B)
+ * reports the cached last-set sideband, else the PKTUSB default
+ * (task-5-brief line 5, agent ref sec 17.10).  Passband comes from the
+ * Flag2 narrow bits exactly as radio.py:209-221: CW -> 250 if A1A-narrow
+ * else 500; J2B -> 500 if J2B-narrow else 2400; LSB/USB -> 2400;
+ * AM -> 6000.  A flags read failure falls back to the wide values
+ * (radio.py:212-213 swallows RadioError and uses wide defaults).
+ */
+static int system600_get_mode(RIG *rig, vfo_t vfo, rmode_t *mode, pbwidth_t *width)
+{
+    uint8_t rec[SYS600_REC_LEN];
+    struct sys600_flags flags;
+    struct sys600_priv *p = (struct sys600_priv *)STATE(rig)->priv;
+    int have_flags;
+    uint8_t st;
+    int ret;
+
+    (void)vfo; /* single operating mode, VFO-agnostic */
+
+    ret = sys600_read_status(rig, rec);
+    if (ret != RIG_OK)
+    {
+        return ret;
+    }
+
+    st = rec[SYS600_REC_RX_MODE];
+
+    switch (st)
+    {
+    case SYS600_MODE_ST_LSB:
+        *mode = RIG_MODE_LSB;
+        *width = SYS600_PASSBAND_LSB_HZ;
+        return RIG_OK;
+
+    case SYS600_MODE_ST_USB:
+        *mode = RIG_MODE_USB;
+        *width = SYS600_PASSBAND_USB_HZ;
+        return RIG_OK;
+
+    case SYS600_MODE_ST_AM:
+        *mode = RIG_MODE_AM;
+        *width = SYS600_PASSBAND_AM_HZ;
+        return RIG_OK;
+
+    case SYS600_MODE_ST_CW_W:
+    case SYS600_MODE_ST_CW_N:
+        *mode = RIG_MODE_CW;
+        break;
+
+    case SYS600_MODE_ST_J2B:
+        /* Sideband not representable: cached last-set, else PKTUSB. */
+        if (p != NULL && p->j2b_sideband_valid &&
+                p->j2b_sideband == RIG_MODE_PKTLSB)
+        {
+            *mode = RIG_MODE_PKTLSB;
+        }
+        else
+        {
+            *mode = RIG_MODE_PKTUSB;
+        }
+        break;
+
+    default:
+        /* Unknown status mode byte: radio.py:206 falls back to USB via
+         * STATUS_MODE_TO_TOKEN.get(status_mode, "USB") instead of raising;
+         * match that (never error on decode) but shout in the log. */
+        rig_debug(RIG_DEBUG_ERR, "%s: unknown status mode byte 0x%x, "
+                  "reporting USB\n", __func__, (unsigned)st);
+        *mode = RIG_MODE_USB;
+        *width = SYS600_PASSBAND_USB_HZ;
+        return RIG_OK;
+    }
+
+    have_flags = (sys600_read_flags(rig, &flags) == RIG_OK);
+
+    if (*mode == RIG_MODE_CW)
+    {
+        *width = (have_flags && flags.a1a_narrow) ?
+                 SYS600_PASSBAND_CW_N_HZ : SYS600_PASSBAND_CW_W_HZ;
+    }
+    else /* J2B */
+    {
+        *width = (have_flags && flags.j2b_narrow) ?
+                 SYS600_PASSBAND_J2B_N_HZ : SYS600_PASSBAND_J2B_W_HZ;
+    }
+
+    return RIG_OK;
+}
+
+/*
+ * Set VFO: the CAT protocol has a single operating VFO. RIG_VFO_A selects the
+ * VFO (send Recall VFO 05h). RIG_VFO_MEM cannot be selected without a channel
+ * (02h) → return -RIG_ENIMPL (honest error rather than silent no-op).
+ * Anything else is -RIG_ENIMPL.
+ */
+static int system600_set_vfo(RIG *rig, vfo_t vfo)
+{
+    uint8_t frame[SYS600_FRAME_LEN];
+
+    if (vfo == RIG_VFO_A)
+    {
+        /* Recall VFO (05h): return to the last-used VFO */
+        sys600_frame(SYS600_OP_RECALL_VFO, 0, 0, 0, 0, frame);
+        return write_block(RIGPORT(rig), frame, SYS600_FRAME_LEN);
+    }
+
+    return -RIG_ENIMPL;
+}
+
+/*
+ * Get VFO: Read Flags (FAh), Flag1 memory bit -> RIG_VFO_MEM,
+ * else RIG_VFO_A (radio.py:246-249 get_vfo).
+ */
+static int system600_get_vfo(RIG *rig, vfo_t *vfo)
+{
+    struct sys600_flags flags;
+    int ret;
+
+    ret = sys600_read_flags(rig, &flags);
+    if (ret != RIG_OK)
+    {
+        return ret;
+    }
+
+    *vfo = flags.mem ? RIG_VFO_MEM : RIG_VFO_A;
+    return RIG_OK;
+}
+
+/*
+ * Set PTT (0Fh, T=1 on / T=0 off; radio.py:224-227 set_ptt, protocol
+ * ptt_frame).  SAFETY: this radio has NO antenna - the RIG_PTT_ON branch
+ * exists in code but must never be exercised by tests or the simulator
+ * session (task-5-brief line 7: test only PTT-off).
+ */
+static int system600_set_ptt(RIG *rig, vfo_t vfo, ptt_t ptt)
+{
+    uint8_t frame[SYS600_FRAME_LEN];
+    uint8_t t;
+
+    (void)vfo; /* 0F always targets the current operating state */
+
+    switch (ptt)
+    {
+    case RIG_PTT_OFF:
+        t = 0;
+        break;
+
+    case RIG_PTT_ON:
+        t = 1;
+        break;
+
+    default:
+        return -RIG_EINVAL;
+    }
+
+    sys600_frame(SYS600_OP_PTT, t, 0, 0, 0, frame);
+    return write_block(RIGPORT(rig), frame, SYS600_FRAME_LEN);
+}
+
+/*
+ * Get PTT: Read Flags (FAh), Flag2 bit0 = PTT closed by CAT command
+ * (task-5-brief line 8; protocol.py:257 FLAG_F2_PTT_CAT).
+ */
+static int system600_get_ptt(RIG *rig, vfo_t vfo, ptt_t *ptt)
+{
+    struct sys600_flags flags;
+    int ret;
+
+    (void)vfo;
+
+    ret = sys600_read_flags(rig, &flags);
+    if (ret != RIG_OK)
+    {
+        return ret;
+    }
+
+    /* Use transmitting (Flag3 bit7) per protocol/implementation source of truth
+     * (radio.py:231 uses transmitting; agent ref sec 10 lists Flag3 bit7 as
+     * "Transmission in progress"). This is the honest transmit state. */
+    *ptt = flags.transmitting ? RIG_PTT_ON : RIG_PTT_OFF;
+    return RIG_OK;
+}
+
+/*
  * Minimal registration (Task 4).  All fields dump_caps can touch are
  * filled with honest provisional values; a later task refines them.
  * Serial defaults: 4800 8N2 (SYS600_BAUD, radio.py:3-7/54-57) applied by
@@ -515,7 +922,7 @@ struct rig_caps system600_caps =
     /* No RIG_STATUS_OK in this enum; simulator-tested only, no hardware. */
     .status =             RIG_STATUS_UNTESTED,
     .rig_type =           RIG_TYPE_TRANSCEIVER,
-    .ptt_type =           RIG_PTT_NONE, /* set_ptt not wired until a later task */
+    .ptt_type =           RIG_PTT_RIG, /* 0Fh CAT PTT; set_ptt/get_ptt wired (Task 5) */
     .dcd_type =           RIG_DCD_NONE,
     .port_type =          RIG_PORT_SERIAL,
     .serial_rate_min =    SYS600_BAUD,
@@ -562,11 +969,21 @@ struct rig_caps system600_caps =
         RIG_FLT_END,
     },
 
+    .rig_init =           system600_init,
+    .rig_cleanup =        system600_cleanup,
     .rig_open =           system600_open,
     .rig_close =          system600_close,
     .set_freq =           system600_set_freq,
     .get_freq =           system600_get_freq,
+    .set_mode =           system600_set_mode,
+    .get_mode =           system600_get_mode,
+    .set_vfo =            system600_set_vfo,
+    .get_vfo =            system600_get_vfo,
+    .set_ptt =            system600_set_ptt,
+    .get_ptt =            system600_get_ptt,
 
+    /* Per-instance priv data is calloc'ed in system600_init into
+     * STATE(rig)->priv; this caps-level slot stays NULL (ft817 idiom). */
     .priv =               NULL,
     .hamlib_check_rig_caps = HAMLIB_CHECK_RIG_CAPS
 };

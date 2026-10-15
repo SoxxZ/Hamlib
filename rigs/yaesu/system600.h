@@ -130,4 +130,20 @@
 #define SYS600_MODE_ST_AM          0x04
 #define SYS600_MODE_ST_J2B         0x05
 
+/*
+ * Passband handling (radio.py:189-222 set_mode/get_mode).  A requested
+ * passband <= 900 Hz selects the narrow CW/J2B filter variant; <= 0
+ * selects wide (radio.py:190-191).  The passband reported by get_mode is
+ * the radio.py surface-hint mapping: CW narrow -> 250 / wide -> 500,
+ * J2B narrow -> 500 / wide -> 2400, SSB -> 2400, AM -> 6000 Hz.
+ */
+#define SYS600_NARROW_MAX_HZ       900
+#define SYS600_PASSBAND_LSB_HZ     2400
+#define SYS600_PASSBAND_USB_HZ     2400
+#define SYS600_PASSBAND_CW_W_HZ    500
+#define SYS600_PASSBAND_CW_N_HZ    250
+#define SYS600_PASSBAND_AM_HZ      6000
+#define SYS600_PASSBAND_J2B_W_HZ   2400
+#define SYS600_PASSBAND_J2B_N_HZ   500
+
 #endif /* SYSTEM600_H */
