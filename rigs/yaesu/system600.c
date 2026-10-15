@@ -1042,12 +1042,13 @@ static int system600_set_rit(RIG *rig, vfo_t vfo, shortfreq_t rit)
 
     (void)vfo;
 
-    /* round(rit / 10) half away from zero, matching protocol.py carrier_frame. */
+    /* The CAT carrier field is a 10 Hz grid, so round to the nearest 10 Hz
+     * unit; sub-10-Hz RIT values (not representable) snap to the nearer step. */
     units = (rit >= 0) ? ((int32_t)rit + 5) / 10 : ((int32_t)rit - 5) / 10;
 
-    if (units < -32768)
+    if (units < -32767)
     {
-        units = -32768;
+        units = -32767;
     }
     if (units > 32767)
     {
@@ -1182,7 +1183,6 @@ struct rig_caps system600_caps =
     /* Carrier (50h) offset is 16-bit binary in 10 Hz units: +/-327670 Hz. */
     .max_rit =            Hz(327670),
     .max_xit =            Hz(0),
-    .max_ifshift =        Hz(0),
     .max_ifshift =        Hz(0),
     .bank_qty =           0,
     .chan_desc_sz =       0,
