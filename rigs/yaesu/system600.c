@@ -325,14 +325,22 @@ static int system600_get_freq(RIG *rig, vfo_t vfo, freq_t *freq);
  * first so the reply stays aligned, then write, then read the expected
  * size.  Never U=0 (1941 bytes).
  *
+ * The reply is read with read_block, not read_string: read_string is a
+ * text-line reader and its ASCII post-processing strips a leading ';'
+ * (0x3B) from the buffer (iofunc.c:1492-1502), which would corrupt the
+ * record whenever byte 0 - the current memory channel - is 59, and it
+ * mutates the process-global static minlen (iofunc.c:1432).  radio.py
+ * uses a raw read(19); read_block is the matching primitive.
+ *
  * Returns RIG_OK, -RIG_ETIMEOUT if the radio did not answer within the
- * port timeout, -RIG_EPROTO for any short/wrong-length reply, or the
- * write_block error verbatim.
+ * port timeout (read_block's return on timeout/short), -RIG_EPROTO for
+ * any short/wrong-length reply (defense in depth), or the write_block
+ * error verbatim.
  */
 static int sys600_read_status(RIG *rig, uint8_t rec[SYS600_REC_LEN])
 {
     uint8_t frame[SYS600_FRAME_LEN];
-    uint8_t buf[SYS600_STATUS_SIZE_U2 + 1];
+    uint8_t buf[SYS600_STATUS_SIZE_U2];
     int ret;
 
     /* P1 = U selector, everything else 0 (protocol.py:355-362 status_frame). */
@@ -347,18 +355,7 @@ static int sys600_read_status(RIG *rig, uint8_t rec[SYS600_REC_LEN])
         return ret;
     }
 
-    /*
-     * No stopset: the status record is binary and every byte value (0x00
-     * padding included) can occur, so termination is by length only.
-     * expected_len=1 is the documented read idiom (notes sec 1, netrigctl
-     * rigs/dummy/netrigctl.c:326): read_string then pulls exactly one
-     * byte per port_read and stops at rxmax-1 = 19 bytes (rxmax carries
-     * the +1 for its end-of-string byte).  An expected_len of 19 would
-     * instead take read_string_generic's adaptive-minlen path, which
-     * decrements its static minlen per read and issues a zero-length
-     * read after the first byte.
-     */
-    ret = read_string(RIGPORT(rig), buf, sizeof(buf), NULL, 0, 0, 1);
+    ret = read_block(RIGPORT(rig), buf, SYS600_STATUS_SIZE_U2);
     if (ret < 0)
     {
         return ret; /* -RIG_ETIMEOUT (a timeout is a timeout, even partial) */
