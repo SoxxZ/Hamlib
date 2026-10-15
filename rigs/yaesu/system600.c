@@ -8,7 +8,8 @@
  *
  * Two sections: (1) the pure codec - no serial I/O, no Hamlib callbacks,
  * no registration, <stdint.h>/<string.h> only - and (2) below the codec,
- * the Hamlib glue (open/close/set_freq/get_freq + system600_caps, Task 4).
+ * the Hamlib glue (open/close/freq/mode/VFO/PTT/split/RIT + levels,
+ * memory channels and system600_caps; Tasks 4-7).
  * Pure-codec consumers (sys600_veccheck.c) define SYSTEM600_CODEC_ONLY
  * before including this file to compile section 1 alone.
  *
@@ -27,6 +28,7 @@
 #include "hamlib/rig_state.h"  /* STATE(rig)->priv (ft817_init idiom) */
 #include "iofunc.h"
 #include "misc.h"
+#include "cal.h"        /* rig_raw2val for the provisional STRENGTH mapping */
 #endif
 
 #include "system600.h"
@@ -316,6 +318,10 @@ static SYS600_UNUSED_FN int sys600_mode_status_to_cmd(uint8_t status, uint8_t *c
 #define SYSTEM600_MODES (RIG_MODE_LSB | RIG_MODE_USB | RIG_MODE_CW | \
                          RIG_MODE_AM | RIG_MODE_PKTLSB | RIG_MODE_PKTUSB)
 
+/* Memory channels are numbered sequentially 1..100 (agent ref sec 6.1). */
+#define SYS600_MEM_CH_MIN 1
+#define SYS600_MAX_MEM_CH 100
+
 static int sys600_read_status(RIG *rig, uint8_t rec[SYS600_REC_LEN]);
 static int sys600_read_flags(RIG *rig, struct sys600_flags *flags);
 static int system600_init(RIG *rig);
@@ -337,6 +343,10 @@ static int system600_get_split_freq(RIG *rig, vfo_t vfo, freq_t *freq);
 static int system600_set_rit(RIG *rig, vfo_t vfo, shortfreq_t rit);
 static int system600_get_rit(RIG *rig, vfo_t vfo, shortfreq_t *rit);
 static int system600_vfo_op(RIG *rig, vfo_t vfo, vfo_op_t op);
+static int system600_get_level(RIG *rig, vfo_t vfo, setting_t level, value_t *val);
+static int system600_set_mem(RIG *rig, vfo_t vfo, int ch);
+static int system600_get_mem(RIG *rig, vfo_t vfo, int *ch);
+static const char *system600_get_info(RIG *rig);
 
 /*
  * Per-instance private data, allocated in system600_init and released in
@@ -452,6 +462,55 @@ static int sys600_read_flags(RIG *rig, struct sys600_flags *flags)
         return -RIG_EPROTO;
     }
 
+    return RIG_OK;
+}
+
+/*
+ * Read Meter (F7h): flush, write the 5-byte request, read exactly the 5-byte
+ * reply [M][M][M][M][0xF7] and decode byte 0 (agent ref sec 8.3; radio.py:139-141
+ * read_meter via _query).  The reply is binary, so read_block is used, never
+ * read_string (see sys600_read_status).  Returns RIG_OK with *meter in 0..255,
+ * -RIG_ETIMEOUT on timeout, -RIG_EPROTO on a short reply or a bad F7 tail, or
+ * the write_block error verbatim.
+ */
+static int sys600_read_meter(RIG *rig, int *meter)
+{
+    uint8_t frame[SYS600_FRAME_LEN];
+    uint8_t buf[SYS600_METER_REPLY_LEN];
+    int ret;
+
+    sys600_frame(SYS600_OP_READ_METER, 0, 0, 0, 0, frame);
+
+    rig_flush(RIGPORT(rig));
+
+    ret = write_block(RIGPORT(rig), frame, SYS600_FRAME_LEN);
+    if (ret != RIG_OK)
+    {
+        return ret;
+    }
+
+    ret = read_block(RIGPORT(rig), buf, SYS600_METER_REPLY_LEN);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    if (ret != SYS600_METER_REPLY_LEN)
+    {
+        rig_debug(RIG_DEBUG_ERR,
+                  "%s: short meter reply: expected %d bytes, got %d\n",
+                  __func__, SYS600_METER_REPLY_LEN, ret);
+        return -RIG_EPROTO;
+    }
+
+    ret = sys600_decode_meter(buf);
+    if (ret < 0)
+    {
+        rig_debug(RIG_DEBUG_ERR, "%s: bad meter reply tail\n", __func__);
+        return -RIG_EPROTO;
+    }
+
+    *meter = ret;
     return RIG_OK;
 }
 
@@ -1137,6 +1196,179 @@ static int system600_get_ptt(RIG *rig, vfo_t vfo, ptt_t *ptt)
 }
 
 /*
+ * =====================================================================
+ * Task 7: levels + memory channel ops + get_info.
+ * =====================================================================
+ */
+
+/*
+ * Get a receiver level.  Only the two S-meter levels the hardware actually
+ * exposes through the digitized meter (F7h, agent ref sec 8.3) are supported:
+ *
+ *   RIG_LEVEL_RAWSTR   -> the raw meter byte 0..255.
+ *   RIG_LEVEL_STRENGTH -> the raw byte mapped through the provisional linear
+ *                         str_cal (see SYS600_STR_CAL).  The reference
+ *                         documents meter deflection only, not S-units, so
+ *                         this calibration is a documented approximation.
+ *
+ * Everything else (AF, RF, SQL, ...) is -RIG_ENIMPL: the CAT protocol has no
+ * command to read those, and this backend never invents a value.
+ */
+static int system600_get_level(RIG *rig, vfo_t vfo, setting_t level, value_t *val)
+{
+    int meter;
+    int ret;
+
+    (void)vfo; /* level reads are always from the single operating receiver */
+
+    switch (level)
+    {
+    case RIG_LEVEL_RAWSTR:
+    case RIG_LEVEL_STRENGTH:
+        ret = sys600_read_meter(rig, &meter);
+        if (ret != RIG_OK)
+        {
+            return ret;
+        }
+        break;
+
+    default:
+        return -RIG_ENIMPL;
+    }
+
+    if (level == RIG_LEVEL_STRENGTH)
+    {
+        val->i = (int)rig_raw2val(meter, &rig->caps->str_cal);
+    }
+    else
+    {
+        val->i = meter;
+    }
+
+    return RIG_OK;
+}
+
+/*
+ * Select a memory channel (Recall Memory, 02h; agent ref sec 6.1 item 1 and
+ * sec 7).  This matches Hamlib's rig_set_mem semantics ("set the current
+ * memory channel number", src/mem.c:53 - the same mapping the sibling
+ * ft1000d backend uses, ft1000d.c:2831 sends RECALL_MEM).  NOTE: the Task 7
+ * brief's parenthetical named 03h (Write VFO to Memory) for set_mem, but 03h
+ * stores the VFO and does not change the current channel, so it cannot be a
+ * set_mem; the deviation is recorded in the report.
+ *
+ * The radio silently ignores out-of-range commands and has no ack, so the
+ * channel is verified by reading the U=2 record back and checking d[0].
+ */
+static int system600_set_mem(RIG *rig, vfo_t vfo, int ch)
+{
+    uint8_t frame[SYS600_FRAME_LEN];
+    uint8_t rec[SYS600_REC_LEN];
+    int ret;
+
+    (void)vfo;
+
+    if (ch < SYS600_MEM_CH_MIN || ch > SYS600_MAX_MEM_CH)
+    {
+        return -RIG_EINVAL;
+    }
+
+    /* Wire order CH,0,0,0,02 (agent ref sec 7 "Recall Memory N"). */
+    sys600_frame(SYS600_OP_RECALL_MEM, (uint8_t)ch, 0, 0, 0, frame);
+    ret = write_block(RIGPORT(rig), frame, SYS600_FRAME_LEN);
+    if (ret != RIG_OK)
+    {
+        return ret;
+    }
+
+    /* Read-back confirm: the record must now name the recalled channel. */
+    ret = sys600_read_status(rig, rec);
+    if (ret != RIG_OK)
+    {
+        return ret;
+    }
+
+    if (rec[SYS600_REC_MEM] != (uint8_t)ch)
+    {
+        rig_debug(RIG_DEBUG_ERR,
+                  "%s: recall did not stick: asked %d, radio reports %u\n",
+                  __func__, ch, (unsigned)rec[SYS600_REC_MEM]);
+        return -RIG_EPROTO;
+    }
+
+    return RIG_OK;
+}
+
+/*
+ * Get the current memory channel number: read Status Update U=2 and take
+ * d[0] (SYS600_REC_MEM), which is 0 when the radio is in VFO mode.  In VFO
+ * mode there is no current memory channel, so report -RIG_EINVAL rather than
+ * inventing one; a value outside 1..100 is a protocol error.
+ */
+static int system600_get_mem(RIG *rig, vfo_t vfo, int *ch)
+{
+    uint8_t rec[SYS600_REC_LEN];
+    int ret;
+
+    (void)vfo; /* single operating VFO/memory state, VFO-agnostic */
+
+    ret = sys600_read_status(rig, rec);
+    if (ret != RIG_OK)
+    {
+        return ret;
+    }
+
+    if (rec[SYS600_REC_MEM] == 0)
+    {
+        rig_debug(RIG_DEBUG_VERBOSE,
+                  "%s: rig is in VFO mode, no memory channel selected\n",
+                  __func__);
+        return -RIG_EINVAL;
+    }
+
+    if (rec[SYS600_REC_MEM] > SYS600_MAX_MEM_CH)
+    {
+        rig_debug(RIG_DEBUG_ERR, "%s: out-of-range memory channel %u\n",
+                  __func__, (unsigned)rec[SYS600_REC_MEM]);
+        return -RIG_EPROTO;
+    }
+
+    *ch = rec[SYS600_REC_MEM];
+    return RIG_OK;
+}
+
+/*
+ * get_info: short, honest, static description.  No dynamic rig state is
+ * claimed (the protocol has no identification query).
+ */
+static const char *system600_get_info(RIG *rig)
+{
+    (void)rig;
+    return "Yaesu System 600 CAT";
+}
+
+/*
+ * PROVISIONAL S-meter calibration.  The protocol reference documents only the
+ * raw digitized meter deflection (0..255, agent ref sec 8.3) - it does NOT map
+ * that byte to S-units or dBm.  This table is therefore an explicit
+ * approximation: a linear 8-bit mapping with the same shape as the PCR1000
+ * family (rigs/pcr/pcr1000.c), i.e. 0 -> -60 dB, 127 -> 0 dB (S9), 255 -> +60 dB,
+ * relative to S9.  Used only for RIG_LEVEL_STRENGTH; RAWSTR returns the raw byte.
+ */
+#define SYS600_STR_CAL { 3, { { 0, -60 }, { 127, 0 }, { 255, 60 } } }
+
+/*
+ * Memory-channel capability: Write/Recall move the whole VFO record, so a
+ * stored channel carries frequency, mode and (mode-associated) passband
+ * (frg100 idiom, rigs/yaesu/frg100.c:81-85).
+ */
+#define SYS600_MEM_CAP { \
+        .freq = 1,   \
+        .mode = 1,   \
+        .width = 1   \
+    }
+
+/*
  * Minimal registration (Task 4).  All fields dump_caps can touch are
  * filled with honest provisional values; a later task refines them.
  * Serial defaults: 4800 8N2 (SYS600_BAUD, radio.py:3-7/54-57) applied by
@@ -1167,7 +1399,7 @@ struct rig_caps system600_caps =
     .retry =              0,
     .has_get_func =       RIG_FUNC_NONE,
     .has_set_func =       RIG_FUNC_NONE,
-    .has_get_level =      RIG_LEVEL_NONE,
+    .has_get_level =      RIG_LEVEL_STRENGTH | RIG_LEVEL_RAWSTR,
     .has_set_level =      RIG_LEVEL_NONE,
     .has_get_parm =       RIG_PARM_NONE,
     .has_set_parm =       RIG_PARM_NONE,
@@ -1186,13 +1418,24 @@ struct rig_caps system600_caps =
     .max_ifshift =        Hz(0),
     .bank_qty =           0,
     .chan_desc_sz =       0,
-    .chan_list =          { RIG_CHAN_END, },
+    /* One memory bank of 100 channels; set_mem/get_mem are implemented
+     * (Recall Memory 02h + Status U=2 d[0]), frg100-style cap. */
+    .chan_list =          {
+        { SYS600_MEM_CH_MIN, SYS600_MAX_MEM_CH, RIG_MTYPE_MEM, SYS600_MEM_CAP },
+        RIG_CHAN_END,
+    },
     .rx_range_list1 =     {
         {kHz(100), MHz(30), SYSTEM600_MODES, -1, -1, RIG_VFO_A },
         RIG_FRNG_END,
     },
+    /* TX power bounds: the reference documents only the 10 W selection flag
+     * (Flag3 bit1, agent ref sec 10), so 10 W is the honest low bound; the
+     * 100 W high bound is taken from the sibling FT-600 backend
+     * (rigs/yaesu/ft600.c).
+     * NOTE: -1/-1 here made dump_caps report "TX ranges #1 status: Bad (-3)"
+     * (range_sanity_check requires low/high_power >= 0 for TX ranges). */
     .tx_range_list1 =     {
-        {kHz(100), MHz(30), SYSTEM600_MODES, -1, -1, RIG_VFO_A },
+        {kHz(100), MHz(30), SYSTEM600_MODES, W(10), W(100), RIG_VFO_A },
         RIG_FRNG_END,
     },
     .tuning_steps =       {
@@ -1202,6 +1445,9 @@ struct rig_caps system600_caps =
     .filters =            {
         RIG_FLT_END,
     },
+    /* PROVISIONAL: see SYS600_STR_CAL above.  Only consulted for
+     * RIG_LEVEL_STRENGTH; RIG_LEVEL_RAWSTR returns the raw byte. */
+    .str_cal =            SYS600_STR_CAL,
 
     .rig_init =           system600_init,
     .rig_cleanup =        system600_cleanup,
@@ -1222,6 +1468,10 @@ struct rig_caps system600_caps =
     .set_rit =            system600_set_rit,
     .get_rit =            system600_get_rit,
     .vfo_op =             system600_vfo_op,
+    .get_level =          system600_get_level,
+    .set_mem =            system600_set_mem,
+    .get_mem =            system600_get_mem,
+    .get_info =           system600_get_info,
 
     /* Per-instance priv data is calloc'ed in system600_init into
      * STATE(rig)->priv; this caps-level slot stays NULL (ft817 idiom). */
