@@ -86,6 +86,13 @@
 #define SYS600_INTERBYTE_MS        200
 #define SYS600_READ_TIMEOUT_MS     8000
 #define SYS600_WRITE_TIMEOUT_MS    4000
+/* Gap after every write.  Hardware: the System 600 silently drops a frame
+ * written back-to-back with the previous one (measuring a Status U=1 issued
+ * 0 ms after Recall Memory: no reply; >=10 ms: always a reply). */
+#define SYS600_POST_WRITE_DELAY_MS 20
+/* After a VFO<->memory recall the radio ignores every command for ~150 ms
+ * (probe9); pad the recall write by this much so the next command is heard. */
+#define SYS600_MEM_RECALL_SETTLE_MS 250
 
 /*
  * Documented frequency span implied by the 9-byte record frequency vectors
@@ -95,17 +102,21 @@
 #define SYS600_FREQ_MAX_HZ         30000000u
 
 /*
- * 19-byte operating / memory data record layout (protocol.py:226-247;
- * agent ref sec 11): [mem(1)][Tx VFO(9)][Rx VFO(9)] - diagram order, Tx
- * first.  The manual's prose headings disagree; protocol.py:240 follows the
- * diagram.
+ * 19-byte operating / memory data record layout (agent ref sec 11/17.6):
+ * [mem(1)][Rx VFO(9)][Tx VFO(9)].
+ *
+ * NOTE: the manual's diagram shows Tx first and the prose headings say
+ * "Rx VFO and Tx VFO".  Verified on real hardware (System 600, 2026-10):
+ * 8Ah (Set Transmit Freq) changes ONLY the second sub-record while 0Ah
+ * (Set Receive Freq) changes the first (and pulls Tx along when not split).
+ * So Rx is first, Tx second - the prose order, not the diagram.
  */
 #define SYS600_REC_LEN             19
-#define SYS600_REC_MEM             0       /* d[0]: memory channel number (0 = VFO) */
-#define SYS600_REC_TX              1       /* d[1..9]: Tx VFO sub-record */
-#define SYS600_REC_RX              10      /* d[10..18]: Rx VFO sub-record */
-#define SYS600_REC_TX_MODE         7       /* d[SYS600_REC_TX + SYS600_VFO_MODE] */
-#define SYS600_REC_RX_MODE         16      /* d[SYS600_REC_RX + SYS600_VFO_MODE] */
+#define SYS600_REC_FLAG0           0       /* d[0]: mode flags (0x20 VFO / 0xA0 MEM), NOT a channel */
+#define SYS600_REC_RX              1       /* d[1..9]: Rx VFO sub-record */
+#define SYS600_REC_TX              10      /* d[10..18]: Tx VFO sub-record */
+#define SYS600_REC_RX_MODE         7       /* d[SYS600_REC_RX + SYS600_VFO_MODE] */
+#define SYS600_REC_TX_MODE         16      /* d[SYS600_REC_TX + SYS600_VFO_MODE] */
 
 /*
  * 9-byte VFO / memory sub-record (protocol.py:187-222; agent ref sec 12).

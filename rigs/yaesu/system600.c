@@ -148,22 +148,20 @@ static void sys600_vfo_freq(const uint8_t *rec9, uint32_t *hz)
 }
 
 /*
- * Decode the 19-byte operating/memory record [mem(1)][Tx(9)][Rx(9)]
- * (protocol.py:236-247 decode_operating_record; agent ref sec 11).
- * Yields Rx freq, Tx freq, the Rx status mode byte (d[16], offsets per
- * system600.h) and the memory channel number in d[0] (0 = VFO).
- * Diagram order (Tx first) is fixed; protocol.py:240's rx_second option is
- * deliberately not ported - the wire layout mandates d[10..18] = Rx.  The caller
+ * Decode the 19-byte operating/memory record [flag0(1)][Rx(9)][Tx(9)]
+ * (agent ref sec 11/17.6).  Yields the Rx and Tx frequencies; d[0] is a
+ * status flag (see SYS600_REC_FLAG0) and the Rx mode byte is read directly
+ * from SYS600_REC_RX_MODE by the callers that need it.  The caller
  * guarantees 19 bytes.
+ *
+ * The manual's diagram puts Tx first, but real hardware puts Rx first (8Ah
+ * changes only the second sub-record, 0Ah the first).  See system600.h.
  */
 static void sys600_decode_record(const uint8_t rec[SYS600_REC_LEN],
-                                 uint32_t *rx_hz, uint32_t *tx_hz,
-                                 uint8_t *mode, uint8_t *mem)
+                                 uint32_t *rx_hz, uint32_t *tx_hz)
 {
-    *mem = rec[SYS600_REC_MEM];
     sys600_vfo_freq(rec + SYS600_REC_TX, tx_hz);
     sys600_vfo_freq(rec + SYS600_REC_RX, rx_hz);
-    *mode = rec[SYS600_REC_RX_MODE];
 }
 
 /*
@@ -441,6 +439,53 @@ static int sys600_read_status(RIG *rig, uint8_t rec[SYS600_REC_LEN])
 }
 
 /*
+ * Read the current memory number: Status Update U=1 (1 byte).
+ *
+ * Hardware (System 600, 2026-10): this byte is the 0-based memory channel
+ * index (channel 42 -> 0x29), i.e. channel = byte + 1.  The byte at d[0] of
+ * the U=2 record, which the manual calls the "memory number", is in fact a
+ * status flag (0x20 in VFO mode, 0xA0 in memory mode) and never carries the
+ * channel; the manual itself warns not to rely on it (agent ref sec 17.5).
+ * Mirrors sys600_read_status with the 1-byte U=1 selector.
+ * Returns RIG_OK, -RIG_ETIMEOUT, -RIG_EPROTO on a short reply, or the
+ * write_block error verbatim.
+ */
+static int sys600_read_memory_number(RIG *rig, uint8_t *num)
+{
+    uint8_t frame[SYS600_FRAME_LEN];
+    uint8_t buf[SYS600_STATUS_SIZE_U1];
+    int ret;
+
+    /* P1 = U selector (1), everything else 0. */
+    sys600_frame(SYS600_OP_STATUS, 1, 0, 0, 0, frame);
+
+    rig_flush(RIGPORT(rig));
+
+    ret = write_block(RIGPORT(rig), frame, SYS600_FRAME_LEN);
+    if (ret != RIG_OK)
+    {
+        return ret;
+    }
+
+    ret = read_block(RIGPORT(rig), buf, SYS600_STATUS_SIZE_U1);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    if (ret != SYS600_STATUS_SIZE_U1)
+    {
+        rig_debug(RIG_DEBUG_ERR,
+                  "%s: short U=1 reply: expected %d byte, got %d\n",
+                  __func__, SYS600_STATUS_SIZE_U1, ret);
+        return -RIG_EPROTO;
+    }
+
+    *num = buf[0];
+    return RIG_OK;
+}
+
+/*
  * Read Flags (FAh): flush, write the 5-byte request, read exactly the
  * 5-byte reply, decode with the codec's tail-checked decoder.  Mirrors
  * radio.py:135-137 (read_flags via _query) with the read_block primitive
@@ -628,7 +673,6 @@ static int system600_set_freq(RIG *rig, vfo_t vfo, freq_t freq)
     uint8_t frame[SYS600_FRAME_LEN];
     uint8_t bcd[4];
     uint8_t rec[SYS600_REC_LEN];
-    uint8_t mode, mem;
     uint32_t rx_hz, tx_hz;
     int ret;
 
@@ -661,7 +705,7 @@ static int system600_set_freq(RIG *rig, vfo_t vfo, freq_t freq)
         return ret;
     }
 
-    sys600_decode_record(rec, &rx_hz, &tx_hz, &mode, &mem);
+    sys600_decode_record(rec, &rx_hz, &tx_hz);
     if (rx_hz != (uint32_t)freq)
     {
         rig_debug(RIG_DEBUG_ERR,
@@ -675,8 +719,7 @@ static int system600_set_freq(RIG *rig, vfo_t vfo, freq_t freq)
 
 /*
  * Get Rx/operating frequency: Status Update U=2 (19 bytes), frequency of
- * the Rx sub-record d[10..18] (absolute offsets d[11..13], binary 10 Hz
- * units - see codec).  Never U=0.
+ * the Rx sub-record d[1..9] (binary 10 Hz units - see codec).  Never U=0.
  */
 static int system600_get_freq(RIG *rig, vfo_t vfo, freq_t *freq)
 {
@@ -1004,7 +1047,6 @@ static int system600_get_split_vfo(RIG *rig, vfo_t vfo, split_t *split, vfo_t *t
 {
     uint8_t rec[SYS600_REC_LEN];
     uint32_t rx_hz, tx_hz;
-    uint8_t mode, mem;
     int ret;
 
     (void)vfo;
@@ -1015,7 +1057,7 @@ static int system600_get_split_vfo(RIG *rig, vfo_t vfo, split_t *split, vfo_t *t
         return ret;
     }
 
-    sys600_decode_record(rec, &rx_hz, &tx_hz, &mode, &mem);
+    sys600_decode_record(rec, &rx_hz, &tx_hz);
 
     if (tx_hz != rx_hz)
     {
@@ -1039,7 +1081,6 @@ static int system600_set_split_freq(RIG *rig, vfo_t vfo, freq_t freq)
     uint8_t frame[SYS600_FRAME_LEN];
     uint8_t bcd[4];
     uint8_t rec[SYS600_REC_LEN];
-    uint8_t mode, mem;
     uint32_t rx_hz, tx_hz;
     int ret;
 
@@ -1069,7 +1110,7 @@ static int system600_set_split_freq(RIG *rig, vfo_t vfo, freq_t freq)
         return ret;
     }
 
-    sys600_decode_record(rec, &rx_hz, &tx_hz, &mode, &mem);
+    sys600_decode_record(rec, &rx_hz, &tx_hz);
     if (tx_hz != (uint32_t)freq)
     {
         rig_debug(RIG_DEBUG_ERR,
@@ -1082,13 +1123,12 @@ static int system600_set_split_freq(RIG *rig, vfo_t vfo, freq_t freq)
 }
 
 /*
- * Get Tx frequency from Status Update U=2 (Tx sub-record).
+ * Get Tx frequency from Status Update U=2 (Tx sub-record d[10..18]).
  */
 static int system600_get_split_freq(RIG *rig, vfo_t vfo, freq_t *freq)
 {
     uint8_t rec[SYS600_REC_LEN];
     uint32_t rx_hz, tx_hz;
-    uint8_t mode, mem;
     int ret;
 
     (void)vfo;
@@ -1099,7 +1139,7 @@ static int system600_get_split_freq(RIG *rig, vfo_t vfo, freq_t *freq)
         return ret;
     }
 
-    sys600_decode_record(rec, &rx_hz, &tx_hz, &mode, &mem);
+    sys600_decode_record(rec, &rx_hz, &tx_hz);
     *freq = (freq_t)tx_hz;
     return RIG_OK;
 }
@@ -1280,13 +1320,18 @@ static int system600_get_level(RIG *rig, vfo_t vfo, setting_t level, value_t *va
  * Memory) stores the VFO and does not change the current channel, so it
  * cannot implement set_mem.
  *
- * The radio silently ignores out-of-range commands and has no ack, so the
- * channel is verified by reading the U=2 record back and checking d[0].
+ * No read-back: the radio has no ack and, right after a VFO<->memory switch,
+ * ignores Status queries entirely for ~150 ms (hardware probe9: a U=1 sent
+ * 0/20/50/100 ms after the recall got no reply at all, >=200 ms always
+ * worked), even though the recall itself took effect (the panel showed the
+ * new channel).  So the recall is fire-and-forget here, exactly as in the
+ * sibling ft1000d backend, and the write is padded by
+ * SYS600_MEM_RECALL_SETTLE_MS so the next client command lands after the deaf
+ * window; the current channel is read separately by system600_get_mem.
  */
 static int system600_set_mem(RIG *rig, vfo_t vfo, int ch)
 {
     uint8_t frame[SYS600_FRAME_LEN];
-    uint8_t rec[SYS600_REC_LEN];
     int ret;
 
     (void)vfo;
@@ -1304,59 +1349,40 @@ static int system600_set_mem(RIG *rig, vfo_t vfo, int ch)
         return ret;
     }
 
-    /* Read-back confirm: the record must now name the recalled channel. */
-    ret = sys600_read_status(rig, rec);
-    if (ret != RIG_OK)
-    {
-        return ret;
-    }
-
-    if (rec[SYS600_REC_MEM] != (uint8_t)ch)
-    {
-        rig_debug(RIG_DEBUG_ERR,
-                  "%s: recall did not stick: asked %d, radio reports %u\n",
-                  __func__, ch, (unsigned)rec[SYS600_REC_MEM]);
-        return -RIG_EPROTO;
-    }
-
+    /* Settle: the radio ignores every command for ~150 ms after the recall,
+     * so pause here rather than let the next client command be dropped. */
+    hl_usleep(SYS600_MEM_RECALL_SETTLE_MS * 1000);
     return RIG_OK;
 }
 
 /*
- * Get the current memory channel number: read Status Update U=2 and take
- * d[0] (SYS600_REC_MEM), which is 0 when the radio is in VFO mode.  In VFO
- * mode there is no current memory channel, so report -RIG_EINVAL rather than
- * inventing one; a value outside 1..100 is a protocol error.
+ * Get the current memory channel number: Status Update U=1 (0-based index,
+ * so channel = byte + 1).  In VFO mode the radio still reports the
+ * last-selected memory channel, which Hamlib explicitly allows (src/mem.c:
+ * "it is not mandatory to be in memory mode"); an index outside 0..99 is a
+ * protocol error.
  */
 static int system600_get_mem(RIG *rig, vfo_t vfo, int *ch)
 {
-    uint8_t rec[SYS600_REC_LEN];
+    uint8_t num;
     int ret;
 
     (void)vfo; /* single operating VFO/memory state, VFO-agnostic */
 
-    ret = sys600_read_status(rig, rec);
+    ret = sys600_read_memory_number(rig, &num);
     if (ret != RIG_OK)
     {
         return ret;
     }
 
-    if (rec[SYS600_REC_MEM] == 0)
+    if (num > SYS600_MAX_MEM_CH - 1)
     {
-        rig_debug(RIG_DEBUG_VERBOSE,
-                  "%s: rig is in VFO mode, no memory channel selected\n",
-                  __func__);
-        return -RIG_EINVAL;
-    }
-
-    if (rec[SYS600_REC_MEM] > SYS600_MAX_MEM_CH)
-    {
-        rig_debug(RIG_DEBUG_ERR, "%s: out-of-range memory channel %u\n",
-                  __func__, (unsigned)rec[SYS600_REC_MEM]);
+        rig_debug(RIG_DEBUG_ERR, "%s: out-of-range memory index %u\n",
+                  __func__, (unsigned)num);
         return -RIG_EPROTO;
     }
 
-    *ch = rec[SYS600_REC_MEM];
+    *ch = (int)num + 1;
     return RIG_OK;
 }
 
@@ -1417,7 +1443,10 @@ struct rig_caps system600_caps =
     .serial_parity =      RIG_PARITY_NONE,
     .serial_handshake =   RIG_HANDSHAKE_NONE,
     .write_delay =        0,
-    .post_write_delay =   0,
+    /* The radio drops a frame written back-to-back with the previous one
+     * (measured on hardware: a Status U=1 query sent 0 ms after Recall Memory
+     * gets no reply, >=10 ms always works).  Give every write a ~20 ms gap. */
+    .post_write_delay =   SYS600_POST_WRITE_DELAY_MS,
     .timeout =            SYS600_READ_TIMEOUT_MS,
     .retry =              0,
     .has_get_func =       RIG_FUNC_NONE,
