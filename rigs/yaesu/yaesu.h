@@ -54,6 +54,7 @@ extern struct rig_caps ft747_caps;
 extern struct rig_caps ft757gx_caps;
 extern struct rig_caps ft757gx2_caps;
 extern struct rig_caps ft600_caps;
+extern struct rig_caps system600_caps;
 extern struct rig_caps ft767gx_caps;
 extern struct rig_caps ft817_caps;
 extern struct rig_caps ft857_caps;

@@ -33,9 +33,6 @@
 
 #include "yaesu.h"
 
-/* Not yet in yaesu.h: declared here per Task 4 registration checklist. */
-extern struct rig_caps system600_caps;
-
 struct yaesu_id
 {
     rig_model_t model;

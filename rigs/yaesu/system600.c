@@ -1,21 +1,35 @@
 /*
- * system600.c - Yaesu System 600 (FT-600) CAT codec + Hamlib backend.
+ * system600.c - Yaesu System 600 CAT codec + Hamlib backend.
+ *
+ * system600.c - (C) soxxz 2026
+ *
+ *   This library is free software; you can redistribute it and/or
+ *   modify it under the terms of the GNU Lesser General Public
+ *   License as published by the Free Software Foundation; either
+ *   version 2.1 of the License, or (at your option) any later version.
+ *
+ *   This library is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ *   Lesser General Public License for more details.
+ *
+ *   You should have received a copy of the GNU Lesser General Public
+ *   License along with this library; if not, write to the Free Software
+ *   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
  *
  * Ported strictly from ft600rig/protocol.py (the source of truth for this
- * backend); the protocol.py -> C helper mapping with line numbers is
- * recorded in task-3-report.md.  Agent-reference section numbers in
- * comments refer to YAESU_SYSTEM600_CAT_PROTOCOL_AGENT_REFERENCE.txt.
+ * backend).  Agent-reference section numbers in comments refer to
+ * YAESU_SYSTEM600_CAT_PROTOCOL_AGENT_REFERENCE.txt.
  *
  * Two sections: (1) the pure codec - no serial I/O, no Hamlib callbacks,
  * no registration, <stdint.h>/<string.h> only - and (2) below the codec,
  * the Hamlib glue (open/close/freq/mode/VFO/PTT/split/RIT + levels,
- * memory channels and system600_caps; Tasks 4-7).
+ * memory channels and system600_caps).
  * Pure-codec consumers (sys600_veccheck.c) define SYSTEM600_CODEC_ONLY
  * before including this file to compile section 1 alone.
  *
  * Return convention: 0 on success, negative on invalid input - mirroring
- * Hamlib's RIG_OK / negative-error convention (doc/hamlib-impl-notes.md
- * sec 2) without including rig.h.
+ * Hamlib's RIG_OK / negative-error convention without including rig.h.
  */
 
 #include <stdint.h>
@@ -34,10 +48,11 @@
 #include "system600.h"
 
 /*
- * Not every codec helper is consumed by the Task 4 glue yet (BCD inverse,
- * flags/meter decode and the mode translators are wired up by later tasks;
- * the vector harness exercises them today).  Silence -Wunused-function for
- * them until then.
+ * Some codec helpers are reachable only from the Hamlib glue in section 2
+ * below (flag/meter decoding and the command->status mode translator), so
+ * they are unused when the vector harness compiles section 1 alone.  Mark
+ * them to silence -Wunused-function.  Helpers used only by the harness are
+ * guarded with SYSTEM600_CODEC_ONLY instead.
  */
 #if defined(__GNUC__) || defined(__clang__)
 #define SYS600_UNUSED_FN __attribute__((unused))
@@ -91,12 +106,14 @@ static int sys600_freq_to_bcd(uint32_t hz, uint8_t out[4])
     return 0;
 }
 
+#ifdef SYSTEM600_CODEC_ONLY
 /*
  * Inverse of sys600_freq_to_bcd: F1..F4 -> Hz
- * (protocol.py:175-183 bcd_params_to_freq; used by tests/simulators).
+ * (protocol.py:175-183 bcd_params_to_freq).  Exercised by the vector
+ * harness only; the backend never needs to decode a BCD frequency.
  * Returns 0, or -1 if a nibble is not a decimal digit.
  */
-static SYS600_UNUSED_FN int sys600_bcd_to_freq(const uint8_t in[4], uint32_t *hz)
+static int sys600_bcd_to_freq(const uint8_t in[4], uint32_t *hz)
 {
     uint32_t units = 0;
     int i;
@@ -113,6 +130,7 @@ static SYS600_UNUSED_FN int sys600_bcd_to_freq(const uint8_t in[4], uint32_t *hz
     *hz = units * 10u;
     return 0;
 }
+#endif
 
 /*
  * Decode the frequency of a 9-byte VFO/memory sub-record: offsets 1..3 are
@@ -135,7 +153,7 @@ static void sys600_vfo_freq(const uint8_t *rec9, uint32_t *hz)
  * Yields Rx freq, Tx freq, the Rx status mode byte (d[16], offsets per
  * system600.h) and the memory channel number in d[0] (0 = VFO).
  * Diagram order (Tx first) is fixed; protocol.py:240's rx_second option is
- * deliberately not ported - the brief mandates d[10..18] = Rx.  The caller
+ * deliberately not ported - the wire layout mandates d[10..18] = Rx.  The caller
  * guarantees 19 bytes.
  */
 static void sys600_decode_record(const uint8_t rec[SYS600_REC_LEN],
@@ -258,6 +276,7 @@ static const uint8_t sys600_mode_cmd_to_status_tbl[16] = {
     SYS600_MODE_ST_J2B,     /* 0xF: J2B-USB-N */
 };
 
+#ifdef SYSTEM600_CODEC_ONLY
 /*
  * Status-data mode byte -> MODE (0Ch) command code.  The status byte cannot
  * distinguish J2B sideband (it lives in Flag2), so J2B decodes to the
@@ -272,6 +291,7 @@ static const uint8_t sys600_mode_status_to_cmd_tbl[6] = {
     SYS600_MODE_CMD_AM,         /* 4: AM wide */
     SYS600_MODE_CMD_J2B_USB_W,  /* 5: J2B -> J2B-USB-W default */
 };
+#endif
 
 /*
  * Translate a MODE (0Ch) command code to the status-data mode byte.
@@ -287,11 +307,13 @@ static SYS600_UNUSED_FN int sys600_mode_cmd_to_status(uint8_t cmd, uint8_t *stat
     return 0;
 }
 
+#ifdef SYSTEM600_CODEC_ONLY
 /*
  * Translate a status-data mode byte to a MODE (0Ch) command code.
- * Returns 0, or -1 for an out-of-table status code.
+ * Exercised by the vector harness only; the backend's get_mode uses the
+ * status byte directly.  Returns 0, or -1 for an out-of-table status code.
  */
-static SYS600_UNUSED_FN int sys600_mode_status_to_cmd(uint8_t status, uint8_t *cmd)
+static int sys600_mode_status_to_cmd(uint8_t status, uint8_t *cmd)
 {
     if ((unsigned)status >= sizeof(sys600_mode_status_to_cmd_tbl)) {
         return -1;
@@ -299,13 +321,14 @@ static SYS600_UNUSED_FN int sys600_mode_status_to_cmd(uint8_t status, uint8_t *c
     *cmd = sys600_mode_status_to_cmd_tbl[status];
     return 0;
 }
+#endif
 
 
 /*
  * =====================================================================
- * Hamlib glue (Task 4): open/close, set/get freq, minimal registration.
- * Port semantics come from ft600rig/radio.py; call idioms from
- * doc/hamlib-impl-notes.md sec 1.
+ * Hamlib glue: open/close, set/get freq, minimal registration.
+ * Port semantics come from ft600rig/radio.py; call idioms follow the
+ * ft817 backend (rigs/yaesu/ft817.c).
  * =====================================================================
  */
 
@@ -354,13 +377,13 @@ static const char *system600_get_info(RIG *rig);
  * STATE(rig)->priv).  j2b_sideband caches the last PKTLSB/PKTUSB mode set:
  * the status mode byte cannot encode the J2B sideband (it lives in Flag2,
  * agent ref sec 17.10), so a get_mode on status 5 needs the last-set value.
- * rit_* is the reserved slot for Task 6's RIT cache.
+ * rit_* caches the last RIT offset (the carrier offset is not echoed back).
  */
 struct sys600_priv {
     rmode_t j2b_sideband;       /* last-set RIG_MODE_PKTLSB / RIG_MODE_PKTUSB */
     int j2b_sideband_valid;     /* j2b_sideband holds a set value */
-    int rit_hz;                 /* Task 6 slot: cached RIT offset, Hz */
-    int rit_valid;              /* Task 6 slot: rit_hz holds a value */
+    int rit_hz;                 /* cached RIT offset, Hz */
+    int rit_valid;              /* rit_hz holds a value */
 };
 
 /*
@@ -518,7 +541,7 @@ static int sys600_read_meter(RIG *rig, int *meter)
  * Init: allocate the per-instance priv data (ft817_init idiom,
  * rigs/yaesu/ft817.c:622-636).  calloc zeroes everything: j2b_sideband
  * starts "never set" so get_mode reports PKTUSB until a PKTLSB/PKTUSB
- * set_mode teaches us the sideband (task-5-brief line 5).
+ * set_mode teaches us the sideband.
  */
 static int system600_init(RIG *rig)
 {
@@ -536,7 +559,7 @@ static int system600_init(RIG *rig)
 /*
  * Cleanup: release the priv data (ft817_cleanup idiom,
  * rigs/yaesu/ft817.c:638-646).  rig_cleanup's return code is ignored by
- * the frontend (doc/hamlib-impl-notes.md sec 4).
+ * the frontend.
  */
 static int system600_cleanup(RIG *rig)
 {
@@ -676,7 +699,7 @@ static int system600_get_freq(RIG *rig, vfo_t vfo, freq_t *freq)
 
 /*
  * =====================================================================
- * Task 5: mode / VFO / PTT callbacks.  Semantics from ft600rig/radio.py
+ * Mode / VFO / PTT callbacks.  Semantics from ft600rig/radio.py
  * (set/get_mode 189-222, set/get_ptt 224-231, set/get_vfo 233-249).
  * =====================================================================
  */
@@ -791,7 +814,7 @@ static int system600_set_mode(RIG *rig, vfo_t vfo, rmode_t mode, pbwidth_t width
  * Get operating mode + passband.  The status mode byte selects the mode
  * family (protocol.py:115-122 STATUS_MODE_TO_TOKEN); status 5 (J2B)
  * reports the cached last-set sideband, else the PKTUSB default
- * (task-5-brief line 5, agent ref sec 17.10).  Passband comes from the
+ * (agent ref sec 17.10).  Passband comes from the
  * Flag2 narrow bits exactly as radio.py:209-221: CW -> 250 if A1A-narrow
  * else 500; J2B -> 500 if J2B-narrow else 2400; LSB/USB -> 2400;
  * AM -> 6000.  A flags read failure falls back to the wide values
@@ -921,7 +944,7 @@ static int system600_get_vfo(RIG *rig, vfo_t *vfo)
  * Set PTT (0Fh, T=1 on / T=0 off; radio.py:224-227 set_ptt, protocol
  * ptt_frame).  SAFETY: this radio has NO antenna - the RIG_PTT_ON branch
  * exists in code but must never be exercised by tests or the simulator
- * session (task-5-brief line 7: test only PTT-off).
+ * session (test only PTT-off).
  */
 static int system600_set_ptt(RIG *rig, vfo_t vfo, ptt_t ptt)
 {
@@ -1085,10 +1108,10 @@ static int system600_get_split_freq(RIG *rig, vfo_t vfo, freq_t *freq)
  * Set RIT: Carrier (50h), 16-bit BINARY twos-complement in 10 Hz units
  * (NOT BCD despite the manual - protocol.py:365-381 carrier_frame; agent ref
  * sec 17.3).  Wire order is [F2][F1][S][W][0x50] where F1:F2 is the big-endian
- * 16-bit value, S=1 (set now), W=0.  Worked example from the brief:
+ * 16-bit value, S=1 (set now), W=0.  Worked example:
  * +1.5k -> +1500 Hz = +150 units = 0x0096 -> 96 00 01 00 50.
  * The carrier offset is not echoed in the status record, so the value is
- * cached in priv for get_rit (brief line 5).
+ * cached in priv for get_rit.
  */
 static int system600_set_rit(RIG *rig, vfo_t vfo, shortfreq_t rit)
 {
@@ -1172,8 +1195,9 @@ static int system600_vfo_op(RIG *rig, vfo_t vfo, vfo_op_t op)
 }
 
 /*
- * Get PTT: Read Flags (FAh), Flag2 bit0 = PTT closed by CAT command
- * (task-5-brief line 8; protocol.py:257 FLAG_F2_PTT_CAT).
+ * Get PTT: Read Flags (FAh) and report the transmitting state, Flag3 bit7
+ * (radio.py:231 uses transmitting; agent ref sec 10 lists Flag3 bit7 as
+ * "Transmission in progress") - not the CAT-PTT Flag2 bit0.
  */
 static int system600_get_ptt(RIG *rig, vfo_t vfo, ptt_t *ptt)
 {
@@ -1197,7 +1221,7 @@ static int system600_get_ptt(RIG *rig, vfo_t vfo, ptt_t *ptt)
 
 /*
  * =====================================================================
- * Task 7: levels + memory channel ops + get_info.
+ * Levels + memory channel ops + get_info.
  * =====================================================================
  */
 
@@ -1252,10 +1276,9 @@ static int system600_get_level(RIG *rig, vfo_t vfo, setting_t level, value_t *va
  * Select a memory channel (Recall Memory, 02h; agent ref sec 6.1 item 1 and
  * sec 7).  This matches Hamlib's rig_set_mem semantics ("set the current
  * memory channel number", src/mem.c:53 - the same mapping the sibling
- * ft1000d backend uses, ft1000d.c:2831 sends RECALL_MEM).  NOTE: the Task 7
- * brief's parenthetical named 03h (Write VFO to Memory) for set_mem, but 03h
- * stores the VFO and does not change the current channel, so it cannot be a
- * set_mem; the deviation is recorded in the report.
+ * ft1000d backend uses, ft1000d.c:2831 sends RECALL_MEM).  03h (Write VFO to
+ * Memory) stores the VFO and does not change the current channel, so it
+ * cannot implement set_mem.
  *
  * The radio silently ignores out-of-range commands and has no ack, so the
  * channel is verified by reading the U=2 record back and checking d[0].
@@ -1369,10 +1392,10 @@ static const char *system600_get_info(RIG *rig)
     }
 
 /*
- * Minimal registration (Task 4).  All fields dump_caps can touch are
- * filled with honest provisional values; a later task refines them.
+ * Minimal registration.  All fields dump_caps can touch are filled with
+ * honest provisional values.
  * Serial defaults: 4800 8N2 (SYS600_BAUD, radio.py:3-7/54-57) applied by
- * the frontend from these caps fields (notes sec 1).
+ * the frontend from these caps fields.
  */
 struct rig_caps system600_caps =
 {
@@ -1380,11 +1403,11 @@ struct rig_caps system600_caps =
     .model_name =         "System 600",
     .mfg_name =           "Yaesu",
     .version =            "1.0",
-    .copyright =          "GPL",
+    .copyright =          "LGPL",
     /* No RIG_STATUS_OK in this enum; simulator-tested only, no hardware. */
     .status =             RIG_STATUS_UNTESTED,
     .rig_type =           RIG_TYPE_TRANSCEIVER,
-    .ptt_type =           RIG_PTT_RIG, /* 0Fh CAT PTT; set_ptt/get_ptt wired (Task 5) */
+    .ptt_type =           RIG_PTT_RIG, /* 0Fh CAT PTT */
     .dcd_type =           RIG_DCD_NONE,
     .port_type =          RIG_PORT_SERIAL,
     .serial_rate_min =    SYS600_BAUD,
@@ -1430,7 +1453,7 @@ struct rig_caps system600_caps =
     },
     /* TX power bounds: the reference documents only the 10 W selection flag
      * (Flag3 bit1, agent ref sec 10), so 10 W is the honest low bound; the
-     * 100 W high bound is taken from the sibling FT-600 backend
+     * 100 W high bound is taken from the legacy `ft600` backend
      * (rigs/yaesu/ft600.c).
      * NOTE: -1/-1 here made dump_caps report "TX ranges #1 status: Bad (-3)"
      * (range_sanity_check requires low/high_power >= 0 for TX ranges). */
@@ -1439,7 +1462,7 @@ struct rig_caps system600_caps =
         RIG_FRNG_END,
     },
     .tuning_steps =       {
-        {SYSTEM600_MODES, Hz(1)},
+        {SYSTEM600_MODES, Hz(10)},
         RIG_TS_END,
     },
     .filters =            {
