@@ -973,15 +973,24 @@ static int system600_get_vfo(RIG *rig, vfo_t *vfo)
 }
 
 /*
- * Set PTT (0Fh, T=1 on / T=0 off; radio.py:224-227 set_ptt, protocol
- * ptt_frame).  SAFETY: this radio has NO antenna - the RIG_PTT_ON branch
- * exists in code but must never be exercised by tests or the simulator
- * session (test only PTT-off).
+ * Set PTT (0Fh, P1=T: 1 = on / 0 = off; radio.py:224-227 set_ptt, protocol
+ * ptt_frame; agent ref sec 6(7) and the wire table sec 7).
+ *
+ *   PTT on  -> 00 00 00 01 0F
+ *   PTT off -> 00 00 00 00 0F
+ *
+ * The radio returns NO reply to 0Fh, so this function must never read back:
+ * a read would block for the whole SYS600_READ_TIMEOUT_MS with the
+ * transmitter still keyed.  PTT-ON is fully supported: ASK THE USER before
+ * keying (agent ref sec 6(7)); the OFF path is always sent on error and on
+ * close (system600_close), so any error leaves the rig unkeyed.
  */
 static int system600_set_ptt(RIG *rig, vfo_t vfo, ptt_t ptt)
 {
     uint8_t frame[SYS600_FRAME_LEN];
+    uint8_t off[SYS600_FRAME_LEN];
     uint8_t t;
+    int ret;
 
     (void)vfo; /* 0F always targets the current operating state */
 
@@ -992,6 +1001,8 @@ static int system600_set_ptt(RIG *rig, vfo_t vfo, ptt_t ptt)
         break;
 
     case RIG_PTT_ON:
+    case RIG_PTT_ON_MIC:  /* rig_set_ptt folds these to ON for RIG_PTT_RIG */
+    case RIG_PTT_ON_DATA: /* (agent ref sec 18 R8: one CAT PTT, no mic/data) */
         t = 1;
         break;
 
@@ -999,8 +1010,20 @@ static int system600_set_ptt(RIG *rig, vfo_t vfo, ptt_t ptt)
         return -RIG_EINVAL;
     }
 
+    /* Wire order is P4 P3 P2 P1 OPCODE, so P1=T lands just before the opcode:
+     * sys600_frame(OP_PTT, t, 0, 0, 0) == 00 00 00 t 0F. */
     sys600_frame(SYS600_OP_PTT, t, 0, 0, 0, frame);
-    return write_block(RIGPORT(rig), frame, SYS600_FRAME_LEN);
+    ret = write_block(RIGPORT(rig), frame, SYS600_FRAME_LEN);
+
+    /* Fail-safe (agent ref sec 18 R8): if keying failed, make one attempt to
+     * drop PTT and report the original error. */
+    if (ret != RIG_OK && t != 0)
+    {
+        sys600_frame(SYS600_OP_PTT, 0, 0, 0, 0, off);
+        (void)write_block(RIGPORT(rig), off, SYS600_FRAME_LEN);
+    }
+
+    return ret;
 }
 
 /*
@@ -1240,6 +1263,10 @@ static int system600_get_ptt(RIG *rig, vfo_t vfo, ptt_t *ptt)
     {
         return ret;
     }
+
+    rig_debug(RIG_DEBUG_VERBOSE,
+              "%s: Flag3 bit7 (transmission in progress)=%d, Flag2 bit0 (PTT by CAT)=%d\n",
+              __func__, flags.transmitting, flags.ptt_by_cat);
 
     /* Use transmitting (Flag3 bit7) per protocol/implementation source of truth
      * (radio.py:231 uses transmitting; agent ref sec 10 lists Flag3 bit7 as
