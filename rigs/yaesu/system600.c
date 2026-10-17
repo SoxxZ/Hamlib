@@ -167,7 +167,9 @@ static void sys600_decode_record(const uint8_t rec[SYS600_REC_LEN],
 /*
  * Flag bits of the 3 status flag bytes (protocol.py:253-267; agent ref
  * sec 8.2, sec 10).  Flag1: LOCK / memory-vs-VFO operation.  Flag2: PTT by
- * CAT, scan state, filter narrow bits, J2B selected.  Flag3: TX state.
+ * CAT, scan state, filter narrow bits, J2B sideband.  Flag3: TX state.
+ * NOTE: F2 bit5 is labelled "J2B operation selected" in the manual, but on
+ * hardware it is the J2B *sideband*: 1 = USB, 0 = LSB (agent ref sec 10/23).
  */
 #define SYS600_F1_LOCK         0x01
 #define SYS600_F1_MEM          0x20
@@ -177,7 +179,7 @@ static void sys600_decode_record(const uint8_t rec[SYS600_REC_LEN],
 #define SYS600_F2_SCAN         0x04
 #define SYS600_F2_J2B_NARROW   0x08
 #define SYS600_F2_A1A_NARROW   0x10
-#define SYS600_F2_J2B          0x20
+#define SYS600_F2_J2B          0x20    /* J2B USB sideband: 1 = USB, 0 = LSB */
 #define SYS600_F3_TX_10W       0x02
 #define SYS600_F3_TUNER        0x20
 #define SYS600_F3_TX           0x80
@@ -372,14 +374,11 @@ static const char *system600_get_info(RIG *rig);
 /*
  * Per-instance private data, allocated in system600_init and released in
  * system600_cleanup (ft817_init/cleanup idiom: rigs/yaesu/ft817.c:622-646,
- * STATE(rig)->priv).  j2b_sideband caches the last PKTLSB/PKTUSB mode set:
- * the status mode byte cannot encode the J2B sideband (it lives in Flag2,
- * agent ref sec 17.10), so a get_mode on status 5 needs the last-set value.
+ * STATE(rig)->priv).  The J2B sideband is NOT cached - it is read back from
+ * Flag2 bit5 on every get_mode (hardware-verified; agent ref sec 10/23).
  * rit_* caches the last RIT offset (the carrier offset is not echoed back).
  */
 struct sys600_priv {
-    rmode_t j2b_sideband;       /* last-set RIG_MODE_PKTLSB / RIG_MODE_PKTUSB */
-    int j2b_sideband_valid;     /* j2b_sideband holds a set value */
     int rit_hz;                 /* cached RIT offset, Hz */
     int rit_valid;              /* rit_hz holds a value */
 };
@@ -803,7 +802,6 @@ static int system600_set_mode(RIG *rig, vfo_t vfo, rmode_t mode, pbwidth_t width
 {
     uint8_t frame[SYS600_FRAME_LEN];
     uint8_t cmd, want_status, rec[SYS600_REC_LEN];
-    struct sys600_priv *p = (struct sys600_priv *)STATE(rig)->priv;
     int ret;
 
     (void)vfo; /* 0Ch always targets the current operating mode */
@@ -843,31 +841,22 @@ static int system600_set_mode(RIG *rig, vfo_t vfo, rmode_t mode, pbwidth_t width
         return -RIG_EPROTO;
     }
 
-    if (p != NULL &&
-            (mode == RIG_MODE_PKTLSB || mode == RIG_MODE_PKTUSB))
-    {
-        p->j2b_sideband = mode;
-        p->j2b_sideband_valid = 1;
-    }
-
     return RIG_OK;
 }
 
 /*
  * Get operating mode + passband.  The status mode byte selects the mode
- * family (protocol.py:115-122 STATUS_MODE_TO_TOKEN); status 5 (J2B)
- * reports the cached last-set sideband, else the PKTUSB default
- * (agent ref sec 17.10).  Passband comes from the
- * Flag2 narrow bits exactly as radio.py:209-221: CW -> 250 if A1A-narrow
- * else 500; J2B -> 500 if J2B-narrow else 2400; LSB/USB -> 2400;
- * AM -> 6000.  A flags read failure falls back to the wide values
- * (radio.py:212-213 swallows RadioError and uses wide defaults).
+ * family (protocol.py:115-122 STATUS_MODE_TO_TOKEN); for status 5 (J2B) the
+ * sideband comes from Flag2 bit5 (agent ref sec 10 - see the case below).
+ * Passband comes from the Flag2 narrow bits exactly as radio.py:209-221:
+ * CW -> 250 if A1A-narrow else 500; J2B -> 500 if J2B-narrow else 2400;
+ * LSB/USB -> 2400; AM -> 6000.  A flags read failure falls back to the wide
+ * values (radio.py:212-213 swallows RadioError and uses wide defaults).
  */
 static int system600_get_mode(RIG *rig, vfo_t vfo, rmode_t *mode, pbwidth_t *width)
 {
     uint8_t rec[SYS600_REC_LEN];
     struct sys600_flags flags;
-    struct sys600_priv *p = (struct sys600_priv *)STATE(rig)->priv;
     int have_flags;
     uint8_t st;
     int ret;
@@ -905,17 +894,24 @@ static int system600_get_mode(RIG *rig, vfo_t vfo, rmode_t *mode, pbwidth_t *wid
         break;
 
     case SYS600_MODE_ST_J2B:
-        /* Sideband not representable: cached last-set, else PKTUSB. */
-        if (p != NULL && p->j2b_sideband_valid &&
-                p->j2b_sideband == RIG_MODE_PKTLSB)
-        {
-            *mode = RIG_MODE_PKTLSB;
-        }
-        else
+        /* The status mode byte says only "J2B"; the sideband is Flag2 bit5
+         * (agent ref sec 10: bits 3 and 5 carry the data-mode width/sideband).
+         * Hardware-verified 2026-10-16: bit5 toggles with the sideband and
+         * nothing else does - 1 = USB (PKTUSB), 0 = LSB (PKTLSB), confirmed
+         * against the front-panel "J2B LSB" display.  The manual's label "J2B
+         * operation selected" is misleading: the radio clears bit5 in J2B-LSB.
+         * If the flags read fails the sideband is unknown -> PKTUSB default. */
+        if (sys600_read_flags(rig, &flags) != RIG_OK)
         {
             *mode = RIG_MODE_PKTUSB;
+            *width = SYS600_PASSBAND_J2B_W_HZ;
+            return RIG_OK;
         }
-        break;
+
+        *mode = flags.j2b ? RIG_MODE_PKTUSB : RIG_MODE_PKTLSB;
+        *width = flags.j2b_narrow ? SYS600_PASSBAND_J2B_N_HZ
+                                  : SYS600_PASSBAND_J2B_W_HZ;
+        return RIG_OK;
 
     default:
         /* Unknown status mode byte: radio.py:206 falls back to USB via
@@ -928,18 +924,11 @@ static int system600_get_mode(RIG *rig, vfo_t vfo, rmode_t *mode, pbwidth_t *wid
         return RIG_OK;
     }
 
+    /* Only CW falls through to here (J2B returns above; LSB/USB/AM return in
+     * their own cases).  Passband from Flag2 bit4, exactly as radio.py:215. */
     have_flags = (sys600_read_flags(rig, &flags) == RIG_OK);
-
-    if (*mode == RIG_MODE_CW)
-    {
-        *width = (have_flags && flags.a1a_narrow) ?
-                 SYS600_PASSBAND_CW_N_HZ : SYS600_PASSBAND_CW_W_HZ;
-    }
-    else /* J2B */
-    {
-        *width = (have_flags && flags.j2b_narrow) ?
-                 SYS600_PASSBAND_J2B_N_HZ : SYS600_PASSBAND_J2B_W_HZ;
-    }
+    *width = (have_flags && flags.a1a_narrow) ?
+             SYS600_PASSBAND_CW_N_HZ : SYS600_PASSBAND_CW_W_HZ;
 
     return RIG_OK;
 }
