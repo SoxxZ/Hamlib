@@ -747,16 +747,30 @@ static int system600_get_freq(RIG *rig, vfo_t vfo, freq_t *freq)
  */
 
 /*
+ * Choose between the radio's two filter positions for a mode.  The panel has
+ * exactly two: a wide and a narrow passband (CW 500/250 Hz, J2B 2400/500 Hz -
+ * hardware-verified 2026-10-17, agent ref sec 23b).  A request below the
+ * midpoint picks the narrow position; width <= 0 (RIG_PASSBAND_NORMAL) keeps
+ * the radio default, which is the wide position.
+ */
+static int sys600_narrow(pbwidth_t width, pbwidth_t wide_hz, pbwidth_t narrow_hz)
+{
+    return width > 0 && width < (wide_hz + narrow_hz) / 2;
+}
+
+/*
  * Map a Hamlib mode + width to a MODE (0Ch) command byte
- * (radio.py:189-192 set_mode: narrow = 0 < passband <= 900; passband <= 0
- * selects the wide variant).  The radio has no CWR/RTTY/... modes: any
- * rmode outside the CAT table is rejected with -RIG_EINVAL (frg9600.c:189
+ * (radio.py set_mode).  The radio has no CWR/RTTY/... modes: any rmode
+ * outside the CAT table is rejected with -RIG_EINVAL (frg9600.c:189
  * idiom per notes sec 4).
  */
 static int sys600_rmode_to_cmd(rmode_t mode, pbwidth_t width, uint8_t *cmd)
 {
-    int narrow = (width > 0 && width <= SYS600_NARROW_MAX_HZ);
-
+    /* The CAT MODE command carries a *filter position*, not a passband: CW is
+     * 500 Hz (A1A-W) or 250 Hz (A1A-N), J2B is 2400 Hz (wide) or 500 Hz
+     * (narrow).  Pick the closer of the two so that asking for 500 Hz CW
+     * selects the 500 Hz filter instead of silently landing on 250 Hz.
+     * width <= 0 (RIG_PASSBAND_NORMAL) keeps the radio default = wide. */
     switch (mode)
     {
     case RIG_MODE_LSB:
@@ -768,7 +782,9 @@ static int sys600_rmode_to_cmd(rmode_t mode, pbwidth_t width, uint8_t *cmd)
         return 0;
 
     case RIG_MODE_CW:
-        *cmd = narrow ? SYS600_MODE_CMD_CW_N : SYS600_MODE_CMD_CW_W;
+        *cmd = sys600_narrow(width, SYS600_PASSBAND_CW_W_HZ,
+                             SYS600_PASSBAND_CW_N_HZ) ?
+               SYS600_MODE_CMD_CW_N : SYS600_MODE_CMD_CW_W;
         return 0;
 
     case RIG_MODE_AM:
@@ -776,11 +792,15 @@ static int sys600_rmode_to_cmd(rmode_t mode, pbwidth_t width, uint8_t *cmd)
         return 0;
 
     case RIG_MODE_PKTLSB:
-        *cmd = narrow ? SYS600_MODE_CMD_J2B_LSB_N : SYS600_MODE_CMD_J2B_LSB_W;
+        *cmd = sys600_narrow(width, SYS600_PASSBAND_J2B_W_HZ,
+                             SYS600_PASSBAND_J2B_N_HZ) ?
+               SYS600_MODE_CMD_J2B_LSB_N : SYS600_MODE_CMD_J2B_LSB_W;
         return 0;
 
     case RIG_MODE_PKTUSB:
-        *cmd = narrow ? SYS600_MODE_CMD_J2B_USB_N : SYS600_MODE_CMD_J2B_USB_W;
+        *cmd = sys600_narrow(width, SYS600_PASSBAND_J2B_W_HZ,
+                             SYS600_PASSBAND_J2B_N_HZ) ?
+               SYS600_MODE_CMD_J2B_USB_N : SYS600_MODE_CMD_J2B_USB_W;
         return 0;
 
     default:
@@ -802,6 +822,7 @@ static int system600_set_mode(RIG *rig, vfo_t vfo, rmode_t mode, pbwidth_t width
 {
     uint8_t frame[SYS600_FRAME_LEN];
     uint8_t cmd, want_status, rec[SYS600_REC_LEN];
+    struct sys600_flags flags;
     int ret;
 
     (void)vfo; /* 0Ch always targets the current operating mode */
@@ -832,13 +853,78 @@ static int system600_set_mode(RIG *rig, vfo_t vfo, rmode_t mode, pbwidth_t width
         return -RIG_EINVAL;
     }
 
-    if (rec[SYS600_REC_RX_MODE] != want_status)
+    /* The status byte must match the requested mode GROUP.  Hardware
+     * (2026-10-17, agent ref sec 23b): the radio answers 02h for BOTH CW
+     * widths - A1A-N switches the narrow filter but leaves the mode byte at
+     * 02h - so both CW bytes are accepted here and the width is confirmed
+     * from Flag2 below.  The manual's separate "03h = A1A-N" status code was
+     * never observed on this radio.  All four J2B command codes report the
+     * single status byte 05h. */
+    if (rec[SYS600_REC_RX_MODE] != want_status &&
+            !(want_status == SYS600_MODE_ST_CW_W &&
+              rec[SYS600_REC_RX_MODE] == SYS600_MODE_ST_CW_N))
     {
         rig_debug(RIG_DEBUG_ERR,
                   "%s: set did not stick: asked status mode 0x%x, radio reports 0x%x\n",
                   __func__, (unsigned)want_status,
                   (unsigned)rec[SYS600_REC_RX_MODE]);
         return -RIG_EPROTO;
+    }
+
+    /* Width/sideband are NOT in the status byte for the modes that have
+     * variants: CW wide/narrow is Flag2 bit4, J2B width is bit3 and J2B
+     * sideband is bit5.  Confirm them, otherwise a request the radio ignores
+     * would be reported as success (the failure mode that hid the J2B
+     * sideband bug). */
+    switch (cmd)
+    {
+    case SYS600_MODE_CMD_CW_W:
+    case SYS600_MODE_CMD_CW_N:
+    case SYS600_MODE_CMD_J2B_LSB_W:
+    case SYS600_MODE_CMD_J2B_USB_W:
+    case SYS600_MODE_CMD_J2B_LSB_N:
+    case SYS600_MODE_CMD_J2B_USB_N:
+        if (sys600_read_flags(rig, &flags) != RIG_OK)
+        {
+            /* Cannot confirm the variant; the mode byte already matched. */
+            return RIG_OK;
+        }
+
+        if (cmd == SYS600_MODE_CMD_CW_W || cmd == SYS600_MODE_CMD_CW_N)
+        {
+            uint8_t want_narrow = (cmd == SYS600_MODE_CMD_CW_N);
+
+            if (flags.a1a_narrow != want_narrow)
+            {
+                rig_debug(RIG_DEBUG_ERR,
+                          "%s: CW filter did not stick: asked %s, Flag2 bit4=%u\n",
+                          __func__, want_narrow ? "A1A-N" : "A1A-W",
+                          (unsigned)flags.a1a_narrow);
+                return -RIG_EPROTO;
+            }
+        }
+        else
+        {
+            uint8_t want_usb = (cmd == SYS600_MODE_CMD_J2B_USB_W ||
+                                cmd == SYS600_MODE_CMD_J2B_USB_N);
+            uint8_t want_narrow = (cmd == SYS600_MODE_CMD_J2B_LSB_N ||
+                                   cmd == SYS600_MODE_CMD_J2B_USB_N);
+
+            if (flags.j2b != want_usb || flags.j2b_narrow != want_narrow)
+            {
+                rig_debug(RIG_DEBUG_ERR,
+                          "%s: J2B did not stick: asked %s, Flag2 bit5(sideband)=%u "
+                          "bit3(narrow)=%u\n",
+                          __func__, want_usb ? "USB" : "LSB",
+                          (unsigned)flags.j2b, (unsigned)flags.j2b_narrow);
+                return -RIG_EPROTO;
+            }
+        }
+
+        break;
+
+    default:
+        break;
     }
 
     return RIG_OK;
@@ -1446,8 +1532,12 @@ struct rig_caps system600_caps =
     .mfg_name =           "Yaesu",
     .version =            "1.0",
     .copyright =          "LGPL",
-    /* No RIG_STATUS_OK in this enum; simulator-tested only, no hardware. */
-    .status =             RIG_STATUS_UNTESTED,
+    /* Hardware-verified on a real System 600 (2026-10-16/17): frequency,
+     * mode (incl. AM and both J2B sidebands), memory recall, split, step ops,
+     * levels, flags, PTT.  BETA, not STABLE: the S-meter calibration is a
+     * documented approximation and the tuning step / carrier offset are not
+     * readable from the radio. */
+    .status =             RIG_STATUS_BETA,
     .rig_type =           RIG_TYPE_TRANSCEIVER,
     .ptt_type =           RIG_PTT_RIG, /* 0Fh CAT PTT */
     .dcd_type =           RIG_DCD_NONE,
@@ -1510,7 +1600,18 @@ struct rig_caps system600_caps =
         {SYSTEM600_MODES, Hz(10)},
         RIG_TS_END,
     },
+    /* The radio has two filter positions per mode (hardware-verified
+     * 2026-10-17).  The panel default is the WIDE position, so list it first:
+     * the frontend's rig_passband_normal() returns the first entry matching
+     * the mode, and sys600_rmode_to_cmd() maps that width to the wide
+     * position.  LSB/USB/AM have a single fixed filter. */
     .filters =            {
+        {RIG_MODE_LSB | RIG_MODE_USB,       Hz(2400)},
+        {RIG_MODE_CW,                       Hz(500)},
+        {RIG_MODE_CW,                       Hz(250)},
+        {RIG_MODE_AM,                       Hz(6000)},
+        {RIG_MODE_PKTLSB | RIG_MODE_PKTUSB, Hz(2400)},
+        {RIG_MODE_PKTLSB | RIG_MODE_PKTUSB, Hz(500)},
         RIG_FLT_END,
     },
     /* PROVISIONAL: see SYS600_STR_CAL above.  Only consulted for
