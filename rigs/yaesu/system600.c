@@ -366,9 +366,12 @@ static int system600_get_split_freq(RIG *rig, vfo_t vfo, freq_t *freq);
 static int system600_set_rit(RIG *rig, vfo_t vfo, shortfreq_t rit);
 static int system600_get_rit(RIG *rig, vfo_t vfo, shortfreq_t *rit);
 static int system600_vfo_op(RIG *rig, vfo_t vfo, vfo_op_t op);
+static int system600_get_func(RIG *rig, vfo_t vfo, setting_t func, int *status);
 static int system600_get_level(RIG *rig, vfo_t vfo, setting_t level, value_t *val);
 static int system600_set_mem(RIG *rig, vfo_t vfo, int ch);
 static int system600_get_mem(RIG *rig, vfo_t vfo, int *ch);
+static int system600_set_channel(RIG *rig, vfo_t vfo, const channel_t *chan);
+static int system600_get_channel(RIG *rig, vfo_t vfo, channel_t *chan, int read_only);
 static const char *system600_get_info(RIG *rig);
 
 /*
@@ -384,10 +387,10 @@ struct sys600_priv {
 };
 
 /*
- * Status Update (10h) with U=2: request, then read exactly the 19-byte
- * operating record.  Mirrors radio.py:115-132 (_query): flush stale input
- * first so the reply stays aligned, then write, then read the expected
- * size.  Never U=0 (1941 bytes).
+ * Generic Status Update (10h) request/response: flush stale input, write the
+ * 5-byte block with the U selector in P1 and CH in P4 (significant only for
+ * U=4 - agent ref sec 6, sec 14), then read exactly `expect` bytes.  Mirrors
+ * radio.py:115-132 (_query).
  *
  * The reply is read with read_block, not read_string: read_string is a
  * text-line reader and its ASCII post-processing strips a leading ';'
@@ -401,14 +404,14 @@ struct sys600_priv {
  * any short/wrong-length reply (defense in depth), or the write_block
  * error verbatim.
  */
-static int sys600_read_status(RIG *rig, uint8_t rec[SYS600_REC_LEN])
+static int sys600_status_query(RIG *rig, uint8_t u, uint8_t ch,
+                               uint8_t *buf, int expect)
 {
     uint8_t frame[SYS600_FRAME_LEN];
-    uint8_t buf[SYS600_STATUS_SIZE_U2];
     int ret;
 
-    /* P1 = U selector, everything else 0 (protocol.py:355-362 status_frame). */
-    sys600_frame(SYS600_OP_STATUS, 2, 0, 0, 0, frame);
+    /* P1 = U selector, P4 = CH (U=4), P2/P3 dummy (protocol.py:355-362). */
+    sys600_frame(SYS600_OP_STATUS, u, 0, 0, ch, frame);
 
     /* Drop stale bytes so we stay aligned (radio.py:117 reset_input_buffer). */
     rig_flush(RIGPORT(rig));
@@ -419,18 +422,56 @@ static int sys600_read_status(RIG *rig, uint8_t rec[SYS600_REC_LEN])
         return ret;
     }
 
-    ret = read_block(RIGPORT(rig), buf, SYS600_STATUS_SIZE_U2);
+    ret = read_block(RIGPORT(rig), buf, expect);
     if (ret < 0)
     {
         return ret; /* -RIG_ETIMEOUT (a timeout is a timeout, even partial) */
     }
 
-    if (ret != SYS600_STATUS_SIZE_U2)
+    if (ret != expect)
     {
         rig_debug(RIG_DEBUG_ERR,
-                  "%s: short status reply: expected %d bytes, got %d\n",
-                  __func__, SYS600_STATUS_SIZE_U2, ret);
+                  "%s: short status reply (U=%u): expected %d bytes, got %d\n",
+                  __func__, (unsigned)u, expect, ret);
         return -RIG_EPROTO;
+    }
+
+    return RIG_OK;
+}
+
+/*
+ * Status Update (10h) with U=2: request, then read exactly the 19-byte
+ * operating record.  Never U=0 (1941 bytes).
+ */
+static int sys600_read_status(RIG *rig, uint8_t rec[SYS600_REC_LEN])
+{
+    uint8_t buf[SYS600_STATUS_SIZE_U2];
+    int ret;
+
+    ret = sys600_status_query(rig, 2, 0, buf, SYS600_STATUS_SIZE_U2);
+    if (ret != RIG_OK)
+    {
+        return ret;
+    }
+
+    memcpy(rec, buf, SYS600_REC_LEN);
+    return RIG_OK;
+}
+
+/*
+ * Status Update (10h) with U=4 CH: the 19-byte record of one memory channel
+ * (agent ref sec 14: U=4, CH = 1..100).  Non-invasive: reading a channel does
+ * not recall it or otherwise touch the radio's current state.
+ */
+static int sys600_read_mem_record(RIG *rig, int ch, uint8_t rec[SYS600_REC_LEN])
+{
+    uint8_t buf[SYS600_STATUS_SIZE_U4];
+    int ret;
+
+    ret = sys600_status_query(rig, 4, (uint8_t)ch, buf, SYS600_STATUS_SIZE_U4);
+    if (ret != RIG_OK)
+    {
+        return ret;
     }
 
     memcpy(rec, buf, SYS600_REC_LEN);
@@ -445,39 +486,18 @@ static int sys600_read_status(RIG *rig, uint8_t rec[SYS600_REC_LEN])
  * the U=2 record, which the manual calls the "memory number", is in fact a
  * status flag (0x20 in VFO mode, 0xA0 in memory mode) and never carries the
  * channel; the manual itself warns not to rely on it (agent ref sec 17.5).
- * Mirrors sys600_read_status with the 1-byte U=1 selector.
  * Returns RIG_OK, -RIG_ETIMEOUT, -RIG_EPROTO on a short reply, or the
  * write_block error verbatim.
  */
 static int sys600_read_memory_number(RIG *rig, uint8_t *num)
 {
-    uint8_t frame[SYS600_FRAME_LEN];
     uint8_t buf[SYS600_STATUS_SIZE_U1];
     int ret;
 
-    /* P1 = U selector (1), everything else 0. */
-    sys600_frame(SYS600_OP_STATUS, 1, 0, 0, 0, frame);
-
-    rig_flush(RIGPORT(rig));
-
-    ret = write_block(RIGPORT(rig), frame, SYS600_FRAME_LEN);
+    ret = sys600_status_query(rig, 1, 0, buf, SYS600_STATUS_SIZE_U1);
     if (ret != RIG_OK)
     {
         return ret;
-    }
-
-    ret = read_block(RIGPORT(rig), buf, SYS600_STATUS_SIZE_U1);
-    if (ret < 0)
-    {
-        return ret;
-    }
-
-    if (ret != SYS600_STATUS_SIZE_U1)
-    {
-        rig_debug(RIG_DEBUG_ERR,
-                  "%s: short U=1 reply: expected %d byte, got %d\n",
-                  __func__, SYS600_STATUS_SIZE_U1, ret);
-        return -RIG_EPROTO;
     }
 
     *num = buf[0];
@@ -1020,6 +1040,63 @@ static int system600_get_mode(RIG *rig, vfo_t vfo, rmode_t *mode, pbwidth_t *wid
 }
 
 /*
+ * Map a *stored* mode byte (a memory record's Rx/Tx sub-record offset 6) to a
+ * Hamlib mode + passband.  Unlike the live operating record, a memory channel
+ * cannot carry filter variants: hardware-verified 2026-10-17, A1A-N stores
+ * 02h (same as A1A-W) and every J2B code stores 05h, and bytes 4/5/7/8 are
+ * always zero (agent ref sec 23c).  So CW reports the wide position, J2B
+ * reports the wide PKTUSB default (the same fallback get_mode uses when the
+ * sideband flag cannot be read), and no width is invented for anything else.
+ * Returns 0, or -1 for a mode byte that is not in the status table.
+ */
+static int sys600_record_mode(uint8_t st, rmode_t *mode, pbwidth_t *width)
+{
+    switch (st)
+    {
+    case SYS600_MODE_ST_LSB:
+        *mode = RIG_MODE_LSB;
+        *width = SYS600_PASSBAND_LSB_HZ;
+        return 0;
+
+    case SYS600_MODE_ST_USB:
+        *mode = RIG_MODE_USB;
+        *width = SYS600_PASSBAND_USB_HZ;
+        return 0;
+
+    case SYS600_MODE_ST_CW_W:
+        *mode = RIG_MODE_CW;
+        *width = SYS600_PASSBAND_CW_W_HZ;
+        return 0;
+
+    case SYS600_MODE_ST_CW_N:
+        /* The manual documents a separate A1A-N status code; the live radio
+         * never reports it and stores 02h instead.  Honour it if it appears. */
+        *mode = RIG_MODE_CW;
+        *width = SYS600_PASSBAND_CW_N_HZ;
+        return 0;
+
+    case SYS600_MODE_ST_AM:
+        *mode = RIG_MODE_AM;
+        *width = SYS600_PASSBAND_AM_HZ;
+        return 0;
+
+    case SYS600_MODE_ST_J2B:
+        /* Sideband/width are not stored (see above) -> wide USB default, the
+         * same choice get_mode makes when the flags read fails. */
+        *mode = RIG_MODE_PKTUSB;
+        *width = SYS600_PASSBAND_J2B_W_HZ;
+        return 0;
+
+    default:
+        rig_debug(RIG_DEBUG_ERR, "%s: unknown record mode byte 0x%x, "
+                  "reporting USB\n", __func__, (unsigned)st);
+        *mode = RIG_MODE_USB;
+        *width = SYS600_PASSBAND_USB_HZ;
+        return 0;
+    }
+}
+
+/*
  * Set VFO: the CAT protocol has a single operating VFO. RIG_VFO_A selects the
  * VFO (send Recall VFO 05h). RIG_VFO_MEM cannot be selected without a channel
  * (02h) → return -RIG_ENIMPL (honest error rather than silent no-op).
@@ -1363,25 +1440,77 @@ static int system600_get_ptt(RIG *rig, vfo_t vfo, ptt_t *ptt)
 
 /*
  * =====================================================================
- * Levels + memory channel ops + get_info.
+ * Functions (read-only flags), levels, memory channel ops + get_info.
  * =====================================================================
  */
 
 /*
- * Get a receiver level.  Only the two S-meter levels the hardware actually
- * exposes through the digitized meter (F7h, agent ref sec 8.3) are supported:
+ * Get a rig function.  The CAT protocol has no command to *change* any
+ * function - the LOCK button and the antenna tuner are panel-only - but two
+ * functions are reported by the Read Flags (FAh) bytes, so they are exposed
+ * read-only (set_func stays RIG_FUNC_NONE in caps; rig_set_func returns
+ * -RIG_ENIMPL, which is the honest answer):
  *
- *   RIG_LEVEL_RAWSTR   -> the raw meter byte 0..255.
+ *   RIG_FUNC_LOCK  <- Flag1 bit0 "LOCK is active" (agent ref sec 10)
+ *   RIG_FUNC_TUNER <- Flag3 bit5 "antenna tuner working" (TUNING on LCD)
+ *
+ * Everything else is -RIG_ENIMPL: no other flag bit maps onto a Hamlib
+ * function, and none of them can be commanded anyway.  The scan-state bits
+ * (Flag2 bits 1-2) have no getter in the Hamlib API at all.
+ */
+static int system600_get_func(RIG *rig, vfo_t vfo, setting_t func, int *status)
+{
+    struct sys600_flags flags;
+    int ret;
+
+    (void)vfo; /* functions are read from the single operating state */
+
+    ret = sys600_read_flags(rig, &flags);
+    if (ret != RIG_OK)
+    {
+        return ret;
+    }
+
+    switch (func)
+    {
+    case RIG_FUNC_LOCK:
+        *status = flags.lock;
+        return RIG_OK;
+
+    case RIG_FUNC_TUNER:
+        *status = flags.tuner;
+        return RIG_OK;
+
+    default:
+        return -RIG_ENIMPL;
+    }
+}
+
+/*
+ * Get a receiver level.  Only the values the hardware actually exposes are
+ * supported:
+ *
+ *   RIG_LEVEL_RAWSTR   -> the raw meter byte 0..255 (F7h, agent ref sec 8.3).
  *   RIG_LEVEL_STRENGTH -> the raw byte mapped through the provisional linear
  *                         str_cal (see SYS600_STR_CAL).  The reference
  *                         documents meter deflection only, not S-units, so
  *                         this calibration is a documented approximation.
+ *   RIG_LEVEL_RFPOWER  -> the TX power *selection* from Flag3 bit1 ("TX
+ *                         output of 10 W selected", agent ref sec 10): 0.1
+ *                         when the 10 W position is selected, else 1.0
+ *                         (the caps TX range is 10..100 W).  Read-only: the
+ *                         protocol has no power command, so has_set_level
+ *                         does not include it.  Only the 100 W state was
+ *                         observable on hardware (the panel switch was not
+ *                         moved); the flag itself is straight from the
+ *                         manual's bit table.
  *
  * Everything else (AF, RF, SQL, ...) is -RIG_ENIMPL: the CAT protocol has no
  * command to read those, and this backend never invents a value.
  */
 static int system600_get_level(RIG *rig, vfo_t vfo, setting_t level, value_t *val)
 {
+    struct sys600_flags flags;
     int meter;
     int ret;
 
@@ -1397,6 +1526,16 @@ static int system600_get_level(RIG *rig, vfo_t vfo, setting_t level, value_t *va
             return ret;
         }
         break;
+
+    case RIG_LEVEL_RFPOWER:
+        ret = sys600_read_flags(rig, &flags);
+        if (ret != RIG_OK)
+        {
+            return ret;
+        }
+        /* 10 W out of the 100 W maximum, or the full-power position. */
+        val->f = flags.tx_10w ? 0.1f : 1.0f;
+        return RIG_OK;
 
     default:
         return -RIG_ENIMPL;
@@ -1489,6 +1628,468 @@ static int system600_get_mem(RIG *rig, vfo_t vfo, int *ch)
 }
 
 /*
+ * =====================================================================
+ * Memory channels: read (Status U=4) and write (03h Write VFO to Memory).
+ * =====================================================================
+ */
+
+/* Operating state saved around a channel write (Hamlib requires channel
+ * access to leave the current VFO/memory selection untouched). */
+struct sys600_saved_state {
+    freq_t rx_hz;
+    freq_t tx_hz;
+    rmode_t mode;
+    pbwidth_t width;
+    int in_memory;      /* radio was in memory mode */
+    int mem_idx;        /* U=1 index as read (0-based) */
+    int mem_ch;         /* mem_idx + 1 (what 02h takes) */
+};
+
+static int sys600_save_state(RIG *rig, struct sys600_saved_state *s)
+{
+    struct sys600_flags flags;
+    uint8_t rec[SYS600_REC_LEN];
+    uint8_t num;
+    uint32_t rx_hz, tx_hz;
+    int ret;
+
+    memset(s, 0, sizeof(*s));
+
+    ret = system600_get_mode(rig, RIG_VFO_CURR, &s->mode, &s->width);
+    if (ret != RIG_OK)
+    {
+        return ret;
+    }
+
+    ret = sys600_read_status(rig, rec);
+    if (ret != RIG_OK)
+    {
+        return ret;
+    }
+    sys600_decode_record(rec, &rx_hz, &tx_hz);
+    s->rx_hz = (freq_t)rx_hz;
+    s->tx_hz = (freq_t)tx_hz;
+
+    ret = sys600_read_flags(rig, &flags);
+    if (ret != RIG_OK)
+    {
+        return ret;
+    }
+    s->in_memory = flags.mem;
+
+    /* Always read it: the value is needed both to put the radio back on the
+     * channel it names and to drive sys600_force_clean_vfo().  The radio
+     * reports the last-selected channel even while in VFO operation. */
+    ret = sys600_read_memory_number(rig, &num);
+    if (ret != RIG_OK)
+    {
+        return ret;
+    }
+    s->mem_idx = (int)num;      /* U=1 is 0-based */
+    s->mem_ch = (int)num + 1;
+
+    return RIG_OK;
+}
+
+/* Best effort: report the first error but try every step, so the radio is
+ * never left on an intermediate frequency/mode. */
+static int sys600_restore_state(RIG *rig, const struct sys600_saved_state *s)
+{
+    int first_err = RIG_OK;
+    int ret;
+
+    ret = system600_set_freq(rig, RIG_VFO_CURR, s->rx_hz);
+    if (ret != RIG_OK && first_err == RIG_OK)
+    {
+        first_err = ret;
+    }
+
+    /* When Rx == Tx the 0Ah above already dragged the Tx record along
+     * (verified: 0Ah follows the split state); otherwise restore it.  Doing it
+     * after Rx also covers "the VFO was split before we wrote a channel". */
+    if (s->tx_hz != s->rx_hz)
+    {
+        ret = system600_set_split_freq(rig, RIG_VFO_CURR, s->tx_hz);
+        if (ret != RIG_OK && first_err == RIG_OK)
+        {
+            first_err = ret;
+        }
+    }
+
+    ret = system600_set_mode(rig, RIG_VFO_CURR, s->mode, s->width);
+    if (ret != RIG_OK && first_err == RIG_OK)
+    {
+        first_err = ret;
+    }
+
+    if (s->in_memory)
+    {
+        ret = system600_set_mem(rig, RIG_VFO_CURR, s->mem_ch);
+        if (ret != RIG_OK && first_err == RIG_OK)
+        {
+            first_err = ret;
+        }
+    }
+
+    return first_err;
+}
+
+/*
+ * Get one memory channel's contents: Status Update U=4 CH = the 19-byte memory
+ * record (agent ref sec 14).  Non-invasive - it does not recall the channel -
+ * and read_only is therefore moot: this backend never moves the radio to read
+ * a channel.
+ *
+ * Record decoding (hardware-verified 2026-10-17, agent ref sec 23c):
+ *  - byte 0: SYS600_MEM_REC_EMPTY (0x80) marks an empty channel.  As in the
+ *    sibling ft1000d backend (ft1000d.c:3063-3067), an empty channel returns
+ *    RIG_OK with the remaining fields left zero (freq 0, mode NONE).
+ *  - [1..9]  = Rx sub-record, [10..18] = Tx sub-record (same order as U=2),
+ *    so a stored split channel reports tx_freq != freq and RIG_SPLIT_ON.
+ *  - the sub-record mode byte carries the mode FAMILY only (CW width and J2B
+ *    sideband/width are not stored) -> see sys600_record_mode.
+ */
+static int system600_get_channel(RIG *rig, vfo_t vfo, channel_t *chan,
+                                 int read_only)
+{
+    uint8_t rec[SYS600_REC_LEN];
+    uint32_t rx_hz, tx_hz;
+    int ch;
+    int ret;
+
+    (void)vfo;       /* channel access is VFO-independent */
+    (void)read_only; /* reading a channel never changes the radio */
+
+    if (chan == NULL)
+    {
+        return -RIG_EINVAL;
+    }
+
+    ch = chan->channel_num;
+
+    if (ch < SYS600_MEM_CH_MIN || ch > SYS600_MAX_MEM_CH)
+    {
+        rig_debug(RIG_DEBUG_ERR, "%s: channel %d out of range %d..%d\n",
+                  __func__, ch, SYS600_MEM_CH_MIN, SYS600_MAX_MEM_CH);
+        return -RIG_EINVAL;
+    }
+
+    ret = sys600_read_mem_record(rig, ch, rec);
+    if (ret != RIG_OK)
+    {
+        return ret;
+    }
+
+    /* Clean slate, then only the fields this radio really has (ft1000d idiom
+     * ft1000d.c:2999-3007). */
+    memset(chan, 0, sizeof(*chan));
+    chan->vfo = RIG_VFO_MEM;
+    chan->channel_num = ch;
+
+    if (rec[0] & SYS600_MEM_REC_EMPTY)
+    {
+        /* Blank channel: leave freq/mode zero and mark it skippable, the same
+         * convention the ic746 backend uses for a blank memory (ic746.c:982). */
+        chan->flags = RIG_CHFLAG_SKIP;
+        rig_debug(RIG_DEBUG_VERBOSE, "%s: channel %d is empty\n", __func__, ch);
+        return RIG_OK;
+    }
+
+    sys600_decode_record(rec, &rx_hz, &tx_hz);
+
+    chan->freq = (freq_t)rx_hz;
+    chan->tx_freq = (freq_t)tx_hz;
+    sys600_record_mode(rec[SYS600_REC_RX_MODE], &chan->mode, &chan->width);
+    sys600_record_mode(rec[SYS600_REC_TX_MODE], &chan->tx_mode, &chan->tx_width);
+
+    if (tx_hz != rx_hz)
+    {
+        chan->split = RIG_SPLIT_ON;
+        chan->tx_vfo = RIG_VFO_A;   /* single operating VFO */
+    }
+    else
+    {
+        chan->split = RIG_SPLIT_OFF;
+    }
+
+    return RIG_OK;
+}
+
+/*
+ * Mode byte a 03h-written channel will actually carry: the MODE command code
+ * is not what the record keeps.  A1A-N (03h cmd) is stored as 02h and every
+ * J2B variant (08h/09h/0Eh/0Fh) as 05h - hardware-verified, agent ref sec 23c.
+ */
+static uint8_t sys600_record_code(uint8_t cmd)
+{
+    switch (cmd)
+    {
+    case SYS600_MODE_CMD_LSB:
+        return SYS600_MODE_ST_LSB;
+
+    case SYS600_MODE_CMD_USB:
+        return SYS600_MODE_ST_USB;
+
+    case SYS600_MODE_CMD_CW_W:
+    case SYS600_MODE_CMD_CW_N:
+        return SYS600_MODE_ST_CW_W;
+
+    case SYS600_MODE_CMD_AM:
+        return SYS600_MODE_ST_AM;
+
+    default:    /* 08h/09h/0Eh/0Fh: all four J2B variants store 05h */
+        return SYS600_MODE_ST_J2B;
+    }
+}
+
+/*
+ * Put the radio on a real VFO before a channel store.
+ *
+ * 03h does not copy "the VFO" as such: it copies whatever the radio currently
+ * regards as its data source, and that source survives a plain VFO recall
+ * (05h) - after an empty memory channel has been recalled, a U=2 read keeps
+ * reporting 0xA0 (record byte 0 bit7 set) and a 03h sent in that state stores
+ * an EMPTY record, silently WIPING the target channel.  Reproduced on hardware
+ * (agent ref sec 23c), including the wipe of a channel that held data.
+ *
+ * A real MEM->VFO transition (02h, then 05h) does clear it, so the write path
+ * always performs that pair and then re-reads U=2: if bit7 is still set the
+ * caller must not send 03h.
+ *
+ * mem_idx is the 0-based U=1 index, i.e. the channel the radio already names,
+ * so recalling it changes nothing observable (the last-selected channel and
+ * the operating frequency/mode are left alone - verified on hardware).
+ */
+static int sys600_force_clean_vfo(RIG *rig, int mem_idx)
+{
+    uint8_t frame[SYS600_FRAME_LEN];
+    uint8_t rec[SYS600_REC_LEN];
+    int ret;
+
+    if (mem_idx < 0 || mem_idx >= SYS600_MAX_MEM_CH)
+    {
+        return -RIG_EPROTO;
+    }
+
+    /* Recall Memory (02h): a real switch into memory operation. */
+    sys600_frame(SYS600_OP_RECALL_MEM, (uint8_t)(mem_idx + 1), 0, 0, 0, frame);
+    ret = write_block(RIGPORT(rig), frame, SYS600_FRAME_LEN);
+
+    if (ret != RIG_OK)
+    {
+        return ret;
+    }
+
+    hl_usleep(SYS600_MEM_RECALL_SETTLE_MS * 1000);
+
+    /* Recall VFO (05h): back to the VFO - this is the transition that
+     * discards the stale memory source. */
+    sys600_frame(SYS600_OP_RECALL_VFO, 0, 0, 0, 0, frame);
+    ret = write_block(RIGPORT(rig), frame, SYS600_FRAME_LEN);
+
+    if (ret != RIG_OK)
+    {
+        return ret;
+    }
+
+    hl_usleep(SYS600_MEM_RECALL_SETTLE_MS * 1000);
+
+    /* Prove the source is a real VFO before letting 03h near a channel: if
+     * this bit is still set, 03h would erase the target. */
+    ret = sys600_read_status(rig, rec);
+
+    if (ret != RIG_OK)
+    {
+        return ret;
+    }
+
+    if (rec[0] & SYS600_MEM_REC_EMPTY)
+    {
+        rig_debug(RIG_DEBUG_ERR,
+                  "%s: VFO recall left data source 0x%02x (empty); "
+                  "refusing to write a channel\n", __func__, (unsigned)rec[0]);
+        return -RIG_EIO;
+    }
+
+    return RIG_OK;
+}
+
+/*
+ * Read the channel back and confirm it holds what we asked for.  The radio
+ * has no write acknowledgement, and a silently dropped 03h is exactly how the
+ * "empty source" failure showed up, so the write is never reported as
+ * successful unless the record agrees.  Only the fields the record can hold
+ * are compared (agent ref sec 23c).
+ */
+static int sys600_verify_channel(RIG *rig, int ch, const channel_t *chan,
+                                 uint8_t cmd)
+{
+    uint8_t rec[SYS600_REC_LEN];
+    uint32_t rx_hz, tx_hz;
+    uint8_t want_mode = sys600_record_code(cmd);
+    int ret;
+
+    ret = sys600_read_mem_record(rig, ch, rec);
+
+    if (ret != RIG_OK)
+    {
+        return ret;
+    }
+
+    sys600_decode_record(rec, &rx_hz, &tx_hz);
+
+    if ((freq_t)rx_hz != chan->freq || rec[SYS600_REC_RX_MODE] != want_mode)
+    {
+        rig_debug(RIG_DEBUG_ERR,
+                  "%s: channel %d stored %.0f Hz/mode 0x%02x, wanted "
+                  "%.0f Hz/mode 0x%02x\n", __func__, ch, (double)rx_hz,
+                  (unsigned)rec[SYS600_REC_RX_MODE], (double)chan->freq,
+                  want_mode);
+        return -RIG_EIO;
+    }
+
+    if (chan->split == RIG_SPLIT_ON && chan->tx_freq > 0 &&
+            (freq_t)tx_hz != chan->tx_freq)
+    {
+        rig_debug(RIG_DEBUG_ERR,
+                  "%s: channel %d stored Tx %.0f Hz, wanted %.0f Hz\n",
+                  __func__, ch, (double)tx_hz, (double)chan->tx_freq);
+        return -RIG_EIO;
+    }
+
+    return RIG_OK;
+}
+
+/*
+ * Program a memory channel: Write VFO to Memory (03h, P2=0; agent ref sec 6.1
+ * item 2, hardware-verified 2026-10-17 sec 23: P2=0 writes, P2=1 erases/hides).
+ *
+ * 03h copies the *displayed* VFO, so the sequence is: save the current
+ * operating state, force a clean VFO (sys600_force_clean_vfo), load the
+ * requested frequency/mode/Tx, send 03h, read the channel back
+ * (sys600_verify_channel), then put the radio back exactly where it was.
+ * Hamlib requires channel access to leave the current VFO and memory number
+ * selected (src/mem.c:674-676).
+ *
+ * Only what the record can hold is written: frequency, mode family and the Tx
+ * (split) frequency.  CW width and J2B sideband/width are NOT stored by the
+ * radio (agent ref sec 23c) - the mode family is what gets programmed, exactly
+ * as a panel store would.
+ *
+ * RIG_CHFLAG_SKIP is not mapped onto 03h P2=1 ("Hide CH"): hiding a channel
+ * erases it here (the U=4 record becomes 80h + zeros), which is not what
+ * Hamlib's "skip during scan" flag means.  The erase command is deliberately
+ * left at the protocol level (the Python reference's write_memory(hide=True)).
+ */
+static int system600_set_channel(RIG *rig, vfo_t vfo, const channel_t *chan)
+{
+    struct sys600_saved_state saved;
+    uint8_t frame[SYS600_FRAME_LEN];
+    uint8_t cmd;
+    int ch, ret;
+
+    (void)vfo;
+
+    if (chan == NULL)
+    {
+        return -RIG_EINVAL;
+    }
+
+    ch = chan->channel_num;
+
+    if (ch < SYS600_MEM_CH_MIN || ch > SYS600_MAX_MEM_CH)
+    {
+        rig_debug(RIG_DEBUG_ERR, "%s: channel %d out of range %d..%d\n",
+                  __func__, ch, SYS600_MEM_CH_MIN, SYS600_MAX_MEM_CH);
+        return -RIG_EINVAL;
+    }
+
+    /* 03h writes into a channel; storing "a VFO" is not a radio concept. */
+    if (chan->vfo != RIG_VFO_MEM)
+    {
+        return -RIG_ENIMPL;
+    }
+
+    if (chan->freq <= 0 || chan->mode == RIG_MODE_NONE)
+    {
+        rig_debug(RIG_DEBUG_ERR, "%s: channel %d: freq %.0f / mode 0x%x: "
+                  "nothing to store\n", __func__, ch, (double)chan->freq,
+                  (unsigned)chan->mode);
+        return -RIG_EINVAL;
+    }
+
+    if (sys600_rmode_to_cmd(chan->mode, chan->width, &cmd) != 0)
+    {
+        rig_debug(RIG_DEBUG_ERR, "%s: unsupported mode 0x%x\n", __func__,
+                  (unsigned)chan->mode);
+        return -RIG_EINVAL;
+    }
+
+    ret = sys600_save_state(rig, &saved);
+    if (ret != RIG_OK)
+    {
+        return ret;
+    }
+
+    /* Force a real VFO source: 03h must copy the VFO, and a blank/stale memory
+     * source would make it store an empty record (i.e. erase the channel).
+     * This also covers "the radio is sitting in memory mode". */
+    ret = sys600_force_clean_vfo(rig, saved.mem_idx);
+
+    if (ret != RIG_OK)
+    {
+        return ret; /* nothing has been touched yet: no restore needed */
+    }
+
+    ret = system600_set_freq(rig, RIG_VFO_CURR, chan->freq);
+
+    if (ret == RIG_OK)
+    {
+        if (chan->split == RIG_SPLIT_ON && chan->tx_freq > 0)
+        {
+            ret = system600_set_split_freq(rig, RIG_VFO_CURR, chan->tx_freq);
+        }
+        else
+        {
+            /* Not split: VFO Rx->Tx (85h) so a stale Tx record is not stored
+             * with the channel (0Ah only drags Tx along when not split). */
+            sys600_frame(SYS600_OP_RX_TO_TX, 0, 0, 0, 0, frame);
+            ret = write_block(RIGPORT(rig), frame, SYS600_FRAME_LEN);
+        }
+    }
+
+    if (ret == RIG_OK)
+    {
+        ret = system600_set_mode(rig, RIG_VFO_CURR, chan->mode, chan->width);
+    }
+
+    if (ret == RIG_OK)
+    {
+        /* Wire order CH,0,0,0,03 (P1=CH, P2=0 write; agent ref sec 7). */
+        sys600_frame(SYS600_OP_WRITE_MEM, (uint8_t)ch, 0, 0, 0, frame);
+        ret = write_block(RIGPORT(rig), frame, SYS600_FRAME_LEN);
+    }
+
+    if (ret == RIG_OK)
+    {
+        /* 03h has no acknowledgement: read the channel back so a store the
+         * radio silently dropped is reported instead of claimed as success.
+         * The read must wait out the radio's post-write deaf window. */
+        hl_usleep(SYS600_MEM_WRITE_SETTLE_MS * 1000);
+        ret = sys600_verify_channel(rig, ch, chan, cmd);
+    }
+
+    /* Put the radio back (or back as far as it can be) either way. */
+    if (sys600_restore_state(rig, &saved) != RIG_OK)
+    {
+        rig_debug(RIG_DEBUG_ERR, "%s: state restore failed\n", __func__);
+    }
+
+    return ret;
+}
+
+
+/*
  * get_info: short, honest, static description.  No dynamic rig state is
  * claimed (the protocol has no identification query).
  */
@@ -1511,12 +2112,17 @@ static const char *system600_get_info(RIG *rig)
 /*
  * Memory-channel capability: Write/Recall move the whole VFO record, so a
  * stored channel carries frequency, mode and (mode-associated) passband
- * (frg100 idiom, rigs/yaesu/frg100.c:81-85).
+ * (frg100 idiom, rigs/yaesu/frg100.c:81-85).  The Tx (split) frequency is
+ * honoured too - the record has an independent Tx sub-record - while tx
+ * MODE/width, channel description, tones, flags etc. are not stored by this
+ * radio and are deliberately left undeclared (agent ref sec 23c).
  */
 #define SYS600_MEM_CAP { \
-        .freq = 1,   \
-        .mode = 1,   \
-        .width = 1   \
+        .freq = 1,       \
+        .mode = 1,       \
+        .width = 1,      \
+        .tx_freq = 1,    \
+        .split = 1       \
     }
 
 /*
@@ -1555,9 +2161,15 @@ struct rig_caps system600_caps =
     .post_write_delay =   SYS600_POST_WRITE_DELAY_MS,
     .timeout =            SYS600_READ_TIMEOUT_MS,
     .retry =              0,
-    .has_get_func =       RIG_FUNC_NONE,
+    /* Read-only functions: only LOCK (Flag1 bit0) and TUNER (Flag3 bit5) are
+     * readable, and neither can be *commanded* over CAT (no opcode), so
+     * has_set_func stays empty - rig_set_func answers -RIG_ENIMPL honestly. */
+    .has_get_func =       RIG_FUNC_LOCK | RIG_FUNC_TUNER,
     .has_set_func =       RIG_FUNC_NONE,
-    .has_get_level =      RIG_LEVEL_STRENGTH | RIG_LEVEL_RAWSTR,
+    /* RFPOWER is read-only too: Flag3 bit1 only reports whether the panel's
+     * 10 W position is selected (there is no power opcode). */
+    .has_get_level =      RIG_LEVEL_STRENGTH | RIG_LEVEL_RAWSTR |
+                          RIG_LEVEL_RFPOWER,
     .has_set_level =      RIG_LEVEL_NONE,
     .has_get_parm =       RIG_PARM_NONE,
     .has_set_parm =       RIG_PARM_NONE,
@@ -1637,9 +2249,12 @@ struct rig_caps system600_caps =
     .set_rit =            system600_set_rit,
     .get_rit =            system600_get_rit,
     .vfo_op =             system600_vfo_op,
+    .get_func =           system600_get_func,
     .get_level =          system600_get_level,
     .set_mem =            system600_set_mem,
     .get_mem =            system600_get_mem,
+    .set_channel =        system600_set_channel,
+    .get_channel =        system600_get_channel,
     .get_info =           system600_get_info,
 
     /* Per-instance priv data is calloc'ed in system600_init into

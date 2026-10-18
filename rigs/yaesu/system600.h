@@ -93,6 +93,10 @@
 /* After a VFO<->memory recall the radio ignores every command for ~150 ms
  * (probe9); pad the recall write by this much so the next command is heard. */
 #define SYS600_MEM_RECALL_SETTLE_MS 250
+/* Write VFO to Memory (03h) goes deaf the same way: a U=4 read-back issued
+ * 20 ms after 03h got no reply at all (8 s timeout, 2026-10-17) although the
+ * store had landed, so the verification read is padded by this much. */
+#define SYS600_MEM_WRITE_SETTLE_MS  250
 
 /*
  * Documented frequency span implied by the 9-byte record frequency vectors
@@ -129,6 +133,31 @@
 #define SYS600_VFO_BAND            0       /* BPF selection 00h..09h */
 #define SYS600_VFO_FREQ            1       /* offsets 1..3: 24-bit big-endian, 10 Hz units */
 #define SYS600_VFO_MODE            6       /* status mode byte (SYS600_MODE_ST_*) */
+
+/*
+ * Record flag byte (byte 0 of a 19-byte record: a U=4 per-channel memory
+ * record, each 1900-byte-bank unit of a U=0 dump, or the U=2/U=0 *operating*
+ * record).  Hardware-verified on a real System 600, 2026-10-17.
+ *
+ *  - memory record: 0x20 = programmed, 0x80 = empty (never written, or erased
+ *    with "Hide CH", 03h P2=1).
+ *  - operating record: 0x20 = the displayed data comes from a valid source,
+ *    0x80 appears once the last-recalled memory channel is EMPTY (a U=2 read
+ *    then shows 0xA0 = 0x80|0x20, memory operation on a blank channel).
+ *
+ * The operating-record 0x80 is not cosmetic: while it is set, 03h (Write VFO
+ * to Memory) copies that stale/blank source and stores an EMPTY record - i.e.
+ * it WIPES the target channel (reproduced on hardware).  system600_set_channel
+ * therefore forces a genuine MEM->VFO transition (02h then 05h) and never
+ * sends 03h unless a fresh U=2 read shows the bit clear (agent ref sec 23c).
+ *
+ * The stored record can only carry a mode FAMILY: A1A-N stores 02h (same as
+ * A1A-W) and all four J2B command codes store 05h, so CW width, J2B sideband
+ * and J2B width are NOT remembered per channel (bytes 4, 5, 7, 8 are always
+ * zero).  get_channel reports the wide default for those variants.
+ */
+#define SYS600_MEM_REC_PROGRAMMED  0x20
+#define SYS600_MEM_REC_EMPTY       0x80
 
 /*
  * MODE (0Ch) command parameter values (protocol.py:66-75; agent ref sec 6,
