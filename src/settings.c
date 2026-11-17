@@ -519,32 +519,37 @@ int HAMLIB_API rig_set_func(RIG *rig, vfo_t vfo, setting_t func, int status)
 
     caps = rig->caps;
 
-    if ((caps->set_func == NULL || !rig_has_set_func(rig, func))
-            && access(rs->tuner_control_pathname, X_OK) == -1)
+    /*
+     * The external program stands in for the rig's antenna tuner, so it
+     * takes over RIG_FUNC_TUNER only.  Every other function belongs to
+     * the backend, whether or not such a program is installed.
+     */
+    if (func == RIG_FUNC_TUNER)
     {
-        return -RIG_ENAVAIL;
-    }
+        if (access(rs->tuner_control_pathname, X_OK) != -1)
+        {
+            char cmd[1024];
+            snprintf(cmd, sizeof(cmd), "%s %d", rs->tuner_control_pathname, status);
+            rig_debug(RIG_DEBUG_TRACE, "%s: Calling external script '%s'\n", __func__,
+                      rs->tuner_control_pathname);
+            retcode = system(cmd);
 
-    if (access(rs->tuner_control_pathname, X_OK) != -1)
-    {
-        char cmd[1024];
-        snprintf(cmd, sizeof(cmd), "%s %d", rs->tuner_control_pathname, status);
-        rig_debug(RIG_DEBUG_TRACE, "%s: Calling external script '%s'\n", __func__,
-                  rs->tuner_control_pathname);
-        retcode = system(cmd);
+            if (retcode != 0) { rig_debug(RIG_DEBUG_ERR, "%s: executing %s failed\n", __func__, rs->tuner_control_pathname); }
 
-        if (retcode != 0) { rig_debug(RIG_DEBUG_ERR, "%s: executing %s failed\n", __func__, rs->tuner_control_pathname); }
+            return (retcode == 0 ? RIG_OK : -RIG_ERJCTED);
+        }
 
-        return (retcode == 0 ? RIG_OK : -RIG_ERJCTED);
-    }
-    else
-    {
         if (strcmp(rs->tuner_control_pathname, "hamlib_tuner_control"))
         {
             rig_debug(RIG_DEBUG_ERR, "%s: unable to find '%s'\n", __func__,
                       rs->tuner_control_pathname);
             return -RIG_EINVAL;
         }
+    }
+
+    if (caps->set_func == NULL || !rig_has_set_func(rig, func))
+    {
+        return -RIG_ENAVAIL;
     }
 
     if ((caps->targetable_vfo & RIG_TARGETABLE_FUNC)
@@ -1184,7 +1189,8 @@ HAMLIB_EXPORT(int) rig_settings_save(const char *setting, void *value,
     while (fgets(buf, sizeof(buf), fp))
     {
         char *tmp = strdup(buf);
-        char *s = strtok(tmp, "=");
+        char *saveptr = NULL;
+        char *s = strtok_r(tmp, "=", &saveptr);
 
         if (buf[0] == '#')
         {
@@ -1194,8 +1200,9 @@ HAMLIB_EXPORT(int) rig_settings_save(const char *setting, void *value,
 
         if (s == NULL)
         {
+            char *saveptr2 = NULL;
             rig_debug(RIG_DEBUG_ERR, "%s: unable to parse setting from '%s'\n", __func__,
-                      strtok(buf, "\r\n"));
+                      strtok_r(buf, "\r\n", &saveptr2));
             fclose(fp);
             fclose(fptmp);
             return -RIG_EINTERNAL;
@@ -1203,12 +1210,13 @@ HAMLIB_EXPORT(int) rig_settings_save(const char *setting, void *value,
 
         ++n;
 
-        char *v = strtok(NULL, "\r\n");
+        char *v = strtok_r(NULL, "\r\n", &saveptr);
 
         if (v == NULL)
         {
+            char *saveptr3 = NULL;
             rig_debug(RIG_DEBUG_ERR, "%s: unable to parse value from '%s'\n", __func__,
-                      strtok(buf, "\r\n"));
+                      strtok_r(buf, "\r\n", &saveptr3));
             fclose(fp);
             fclose(fptmp);
             return -RIG_EINTERNAL;
@@ -1261,8 +1269,9 @@ HAMLIB_EXPORT(int) rig_settings_load_all(char *settings_file)
 
     while (fgets(buf, sizeof(buf), fp))
     {
-        const char *s = strtok(buf, "=");
-        const char *v = strtok(NULL, "\r\n");
+        char *saveptr4 = NULL;
+        const char *s = strtok_r(buf, "=", &saveptr4);
+        const char *v = strtok_r(NULL, "\r\n", &saveptr4);
 
         if (strcmp(s, "sharedkey") == 0)
         {

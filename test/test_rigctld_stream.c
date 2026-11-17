@@ -648,6 +648,27 @@ void test_format_name_roundtrip(void)
 }
 
 
+/* The ERROR payload round-trips, and a short or unknown-version block is
+ * refused rather than misread. */
+void test_error_block_roundtrip(void)
+{
+    unsigned char buf[RIG_STREAM_ERROR_WIRE_SIZE];
+    int32_t err = 0;
+    uint32_t reason = 0;
+
+    stream_error_block_pack(-RIG_EIO, RIG_COMM_REASON_LINK_TIMEOUT, buf);
+    TEST_CHECK(buf[0] == 0 && buf[1] == RIG_STREAM_ERROR_BLOCK_VERSION);
+    TEST_CHECK(stream_error_block_unpack(buf, sizeof(buf), &err, &reason) == 0);
+    TEST_CHECK_(err == -RIG_EIO, "rig_error=%d", err);
+    TEST_CHECK(reason == RIG_COMM_REASON_LINK_TIMEOUT);
+
+    TEST_CHECK(stream_error_block_unpack(buf, sizeof(buf) - 1, &err,
+                                         &reason) == -1);
+    buf[1] = 2;
+    TEST_CHECK(stream_error_block_unpack(buf, sizeof(buf), &err, &reason) == -1);
+}
+
+
 void test_format_bitmask_str(void)
 {
     char buf[256];
@@ -2598,6 +2619,24 @@ void test_metadata_refresh_due(void)
 }
 
 
+/* The stream timeouts count from the instant of the last packet, not from the
+ * start of its second. */
+void test_timed_out(void)
+{
+    struct timespec since = { 10, 999000000L };
+    struct timespec now = { 12, 0 };
+
+    /* 1.001 s after a packet late in second 10: whole seconds said 2 */
+    TEST_CHECK(rigctld_stream_timed_out(&since, &now, 2) == 0);
+
+    now.tv_nsec = 998000000L;
+    TEST_CHECK(rigctld_stream_timed_out(&since, &now, 2) == 0);
+
+    now.tv_nsec = 999000000L;
+    TEST_CHECK(rigctld_stream_timed_out(&since, &now, 2) == 1);
+}
+
+
 /* Rate-derived socket buffer sizing with floor/ceiling clamps. */
 void test_transport_buffer_bytes(void)
 {
@@ -2723,9 +2762,24 @@ static int recv_write_status_event(int fd, const struct rigctld_stream *stream,
  * detail (sample_index via the header, lateness/dropped in the block). */
 void test_write_status_emit(void)
 {
-    int rx_fd = -1, rx_port = 0, tx_fd = -1, tx_port = 0;
-    TEST_ASSERT(rigctld_stream_udp_socket_create(&rx_fd, &rx_port) == 0);
-    TEST_ASSERT(rigctld_stream_udp_socket_create(&tx_fd, &tx_port) == 0);
+    int rx_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    int tx_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    TEST_ASSERT(rx_fd >= 0);
+    TEST_ASSERT(tx_fd >= 0);
+
+    /* This test exercises WRITE_STATUS framing, not IPv6 availability.  Use
+     * IPv4 loopback so builds that intentionally disable IPv6 on lo still
+     * test the emit path.  IPv6 parsing and socket creation are covered by
+     * their dedicated tests. */
+    struct sockaddr_in dst;
+    memset(&dst, 0, sizeof(dst));
+    dst.sin_family = AF_INET;
+    dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    dst.sin_port = 0;
+    TEST_ASSERT(bind(rx_fd, (struct sockaddr *)&dst, sizeof(dst)) == 0);
+
+    socklen_t dst_len = sizeof(dst);
+    TEST_ASSERT(getsockname(rx_fd, (struct sockaddr *)&dst, &dst_len) == 0);
 
     struct rigctld_stream stream;
     memset(&stream, 0, sizeof(stream));
@@ -2738,13 +2792,8 @@ void test_write_status_emit(void)
     stream.config.format = RIG_STREAM_FORMAT_PCM_S16;
     stream.format_id = RIG_STREAM_FMT_ID_PCM_S16;
 
-    struct sockaddr_in6 dst;
-    memset(&dst, 0, sizeof(dst));
-    dst.sin6_family = AF_INET6;
-    dst.sin6_addr = in6addr_loopback;
-    dst.sin6_port = htons((uint16_t)rx_port);
     memcpy(&stream.client_addr, &dst, sizeof(dst));
-    stream.client_addr_len = sizeof(dst);
+    stream.client_addr_len = dst_len;
     stream.client_addr_known = 1;
 
     struct rig_stream_write_status ev;
@@ -2752,20 +2801,24 @@ void test_write_status_emit(void)
     ev.event = RIG_STREAM_WRITE_EVENT_LATE;
     ev.sample_index = 12345;
     ev.lateness = 480;
-    rigctld_stream_emit_write_status(&stream, &ev);
+    int ret = rigctld_stream_emit_write_status(&stream, &ev);
+    TEST_ASSERT_(ret == 0, "emit returned %d", ret);
 
-    struct rig_stream_write_status got;
-    TEST_CHECK(recv_write_status_event(rx_fd, &stream, &got)
-               == RIG_STREAM_WRITE_EVENT_LATE);
+    struct rig_stream_write_status got = { 0 };
+    int event = recv_write_status_event(rx_fd, &stream, &got);
+    TEST_ASSERT_(event == RIG_STREAM_WRITE_EVENT_LATE,
+                 "receive returned %d", event);
     TEST_CHECK_(got.sample_index == 12345, "sample_index=%llu",
                 (unsigned long long)got.sample_index);
     TEST_CHECK_(got.lateness == 480, "lateness=%lld", (long long)got.lateness);
 
     ev.event = RIG_STREAM_WRITE_EVENT_OVERRUN;
     ev.dropped_samples = 64;
-    rigctld_stream_emit_write_status(&stream, &ev);
-    TEST_CHECK(recv_write_status_event(rx_fd, &stream, &got)
-               == RIG_STREAM_WRITE_EVENT_OVERRUN);
+    ret = rigctld_stream_emit_write_status(&stream, &ev);
+    TEST_ASSERT_(ret == 0, "emit returned %d", ret);
+    event = recv_write_status_event(rx_fd, &stream, &got);
+    TEST_ASSERT_(event == RIG_STREAM_WRITE_EVENT_OVERRUN,
+                 "receive returned %d", event);
     TEST_CHECK(got.dropped_samples == 64);
 
     /* Nothing more emitted. */
@@ -2932,10 +2985,14 @@ TEST_LIST =
     { "metadata_unpack_too_short",      test_metadata_unpack_too_short },
     { "metadata_freq_only",             test_metadata_freq_only },
 
+    /* Stream timeouts */
+    { "rigctld_stream_timed_out",       test_timed_out },
+
     /* Type and format name mapping */
     { "type_name_roundtrip",   test_type_name_roundtrip },
     { "format_name_roundtrip", test_format_name_roundtrip },
     { "format_bitmask_str",    test_format_bitmask_str },
+    { "error_block_roundtrip", test_error_block_roundtrip },
 
     /* Stream registry */
     { "registry_init_destroy",    test_registry_init_destroy },
